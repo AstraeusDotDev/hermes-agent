@@ -76,11 +76,92 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_initial_block_is_typed_and_sticky(kanban_home: Path) -> None:
+    """A directly-created human-input task cannot bypass its fence."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="await approval",
+            initial_status="blocked",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+        events = kb.list_events(conn, tid)
+        assert [event.kind for event in events] == ["created", "blocked"]
+        assert (events[-1].payload or {}).get("kind") == "needs_input"
+
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_initial_parented_block_is_sticky_until_explicit_unblock(
+    kanban_home: Path,
+) -> None:
+    """Terminal parents do not release an initially blocked child."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        kb.complete_task(conn, parent, result="done")
+        child = kb.create_task(
+            conn,
+            title="approval-gated child",
+            parents=[parent],
+            initial_status="blocked",
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "blocked"
+        assert kb.unblock_task(conn, child)
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_initial_block_and_created_event_roll_back_together(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The typed fence is not left half-written if graph setup fails."""
+    def fail_inheritance(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    with kb.connect() as conn:
+        monkeypatch.setattr(kb, "_inherit_notify_subs", fail_inheritance)
+        with pytest.raises(RuntimeError, match="boom"):
+            kb.create_task(conn, title="atomic fence", initial_status="blocked")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
+
+
 
 
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
+
+
+def test_circuit_breaker_block_still_auto_recovers(kanban_home: Path) -> None:
+    """A ``gave_up`` block remains recoverable when the limit is raised."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="retryable task")
+        assert not kb._record_task_failure(
+            conn,
+            tid,
+            "first failure",
+            outcome="crashed",
+            failure_limit=2,
+        )
+        assert kb._record_task_failure(
+            conn,
+            tid,
+            "second failure",
+            outcome="crashed",
+            failure_limit=2,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn, failure_limit=3) == 1
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 
