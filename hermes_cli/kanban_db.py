@@ -26,6 +26,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+try:
+    from hermes_cli.process_identity import _pid_alive_matches
+except Exception:  # pragma: no cover - fallback when import fails
+    def _pid_alive_matches(pid: int, create_time: Optional[float]) -> Optional[bool]:
+        return None
+
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -984,6 +990,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_create_time  REAL,
+    worker_exe_path      TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1867,10 +1875,8 @@ def _end_run(
                metadata      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
+               claim_expires = NULL
+         WHERE id = ? AND ended_at IS NULL
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
@@ -2075,6 +2081,67 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _worker_create_time(pid: int) -> Optional[float]:
+    """psutil create time for worker ``pid``; None when psutil can't say."""
+    try:
+        import psutil
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def _worker_exe_path(pid: int) -> Optional[str]:
+    """Absolute exe path for worker ``pid``; None when psutil can't say."""
+    try:
+        import psutil
+        return psutil.Process(int(pid)).exe()
+    except Exception:
+        return None
+
+
+def _check_retirement_fence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Check if the previous worker process is still alive.
+
+    Returns 'wait' if the exact prior process is still live (suppress claim),
+    'released' if the process is dead or identity changed (allow claim),
+    or None if no prior run exists.
+    """
+    row = conn.execute(
+        "SELECT worker_pid, worker_create_time, worker_exe_path, ended_at "
+        "FROM task_runs "
+        "WHERE task_id = ? "
+        "ORDER BY COALESCE(ended_at, 9999999999) DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["worker_pid"]:
+        return None
+    # If the most recent run is still active (no ended_at), the worker is
+    # still running — suppress re-claim without a psutil check.
+    if not row["ended_at"]:
+        return "wait"
+    pid = row["worker_pid"]
+    create_time = row["worker_create_time"]
+    alive = _pid_alive_matches(pid, create_time)
+    if alive is None:
+        return "wait"
+    if alive:
+        # Check exe_path if available (additional identity signal)
+        recorded_exe = row["worker_exe_path"]
+        if recorded_exe:
+            try:
+                import psutil
+                live_exe = psutil.Process(int(pid)).exe()
+                if live_exe != recorded_exe:
+                    return "released"
+            except Exception:
+                pass
+        return "wait"
+    return "released"
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None,
@@ -2105,12 +2172,15 @@ def _claim_and_open_run(
         INSERT INTO task_runs (
             task_id, profile, step_key, status,
             claim_lock, claim_expires, max_runtime_seconds,
+            worker_create_time, worker_exe_path,
             started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            lock, expires, trow["max_runtime_seconds"] if trow else None,
+            None, None,  # worker_create_time, worker_exe_path — filled in by _set_worker_pid
+            now,
         ),
     )
     run_id = run_cur.lastrowid
@@ -2145,6 +2215,11 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # Retirement fence: suppress re-claim if prior worker still alive.
+        fence = _check_retirement_fence(conn, task_id)
+        if fence == "wait":
+            _append_event(conn, task_id, "claim_rejected", {"reason": "retirement_wait"})
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2178,6 +2253,11 @@ def claim_review_task(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
+            return None
+        # Retirement fence: suppress re-claim if prior worker still alive.
+        fence = _check_retirement_fence(conn, task_id)
+        if fence == "wait":
+            _append_event(conn, task_id, "claim_rejected", {"reason": "retirement_wait"})
             return None
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},

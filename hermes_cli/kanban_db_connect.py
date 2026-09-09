@@ -883,6 +883,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
 
+    # task_runs fence columns: worker_create_time, worker_exe_path (retirement fence)
+    if _table_exists(conn, "task_runs"):
+        run_cols = _column_names(conn, "task_runs")
+        if "worker_create_time" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "worker_create_time", "worker_create_time REAL")
+        if "worker_exe_path" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "worker_exe_path", "worker_exe_path TEXT")
+
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
         for name, ddl in _NOTIFY_SUB_COLUMNS:

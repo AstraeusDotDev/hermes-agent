@@ -1103,7 +1103,19 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
+            import psutil
+            create_time = None
+            exe_path = None
+            try:
+                proc = psutil.Process(int(pid))
+                create_time = float(proc.create_time())
+                exe_path = proc.exe()
+            except Exception:
+                pass
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_create_time = ?, worker_exe_path = ? WHERE id = ?",
+                (int(pid), create_time, exe_path, run_id),
+            )
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
