@@ -2085,6 +2085,18 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
+    # Retired-worker fence: before claiming, check whether the most recent ended
+    # run still has its original process alive.  If so, leave the card in place
+    # and suppress this tick's spawn (coalesced ``retirement_wait`` receipt).
+    # When the exact process is dead or its identity changed (PID reuse / reboot /
+    # new process), emit a single ``retirement_released`` receipt and allow
+    # normal dispatch.  Unknown or malformed identity fails closed for this card
+    # only — no suppression on a weak identity.
+    retirement_reason = check_retired_worker(conn, task_id, dry_run=dry_run)
+    if retirement_reason is not None:
+        result.respawn_guarded.append((task_id, retirement_reason))
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -2264,6 +2276,157 @@ def _tick_spawn_budget(
             )
             spawn_budget = 1
     return True, spawn_budget
+
+
+# ---------------------------------------------------------------------------
+# Retired-worker fence
+#
+# A lifecycle transition (complete / block / schedule / request-review /
+# request-changes / reclaim) clears the task claim *before* the prior
+# mutation-capable worker has actually exited, which lets a reviewer or repair
+# worker overlap the same worktree.  The fence is checked in
+# ``_dispatch_lane_task`` (ready + review lanes) *before* the claim attempt, so
+# a stale-but-still-live prior worker suppresses the spawn rather than racing
+# it.
+#
+# Identity model (main): ``_set_worker_pid`` persists
+# ``worker_pid`` + ``worker_started_at`` (the ``_process_fingerprint`` string
+# ``"<boot_id>|<start_time>"``) on BOTH the ``tasks`` row and the active
+# ``task_runs`` row; ``_end_run`` retains those columns on the closed run, so
+# the most recent ended run carries the exact process identity needed to decide
+# whether the prior worker is still live.  ``_worker_alive`` is the single
+# liveness predicate: it checks PID existence AND fingerprint match (so a PID
+# recycled after a reboot never counts as our worker) and treats the legacy
+# integer / ``UNVERIFIED_WORKER_FINGERPRINT`` rows as "alive if the PID exists"
+# (fail-open for liveness; the exact-identity path below is fail-closed).
+#
+# Coalesced receipt: the fence emits one ``retirement_wait`` / ``retirement_released``
+# event per ended run, deduped by run_id in the event tail, so concurrent
+# dispatcher ticks do not spam the board.
+# ---------------------------------------------------------------------------
+
+_RETIREMENT_WAIT_KIND = "retirement_wait"
+_RETIREMENT_RELEASED_KIND = "retirement_released"
+
+
+def _ended_run_with_identity(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    """Most recent ENDED run on ``task_id`` that still carries worker identity.
+
+    Returns the row (caller must not mutate) or ``None`` when there is no such
+    run — no fence applies.
+    """
+    # The identity predicates belong in the query, not in the caller: a
+    # completion that also synthesizes an identity-less run row (see
+    # ``kb.complete_task`` -> ``_synthesize_ended_run``) can land in the same
+    # ``ended_at`` second as the real worker run, and ordering alone would then
+    # pick the higher id — the identity-less one — silently releasing a card
+    # whose worker is still alive.
+    return conn.execute(
+        "SELECT id, worker_pid, worker_started_at "
+        "FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def _has_exact_identity(conn: sqlite3.Connection, run: sqlite3.Row) -> bool:
+    """True when the exact prior process is still live.
+
+    ``run`` is an ended-run row.  The PID must still exist (``_worker_alive``
+    uses ``_pid_alive`` + fingerprint match), AND the current process
+    fingerprint must equal the one recorded at spawn.  A legacy integer
+    ``worker_started_at`` or ``UNVERIFIED_WORKER_FINGERPRINT`` row does not
+    carry enough identity to confirm exactness, so it is treated as "not exact"
+    — the task is released, never suppressed on the strength of a weak
+    identity.
+    """
+    pid = run["worker_pid"]
+    if not pid or not isinstance(pid, int):
+        return False
+    started_at = run["worker_started_at"]
+    # ``_worker_alive`` with a string fingerprint does the exact-match check
+    # (boot_id + start_time).  An integer / unverified row can't confirm
+    # exactness, so it is never treated as "still our worker" for suppression.
+    if isinstance(started_at, str) and started_at != UNVERIFIED_WORKER_FINGERPRINT:
+        return bool(_worker_alive(pid, started_at))
+    return False
+
+
+def _coalesced_retirement_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    run_id: int,
+    payload: dict,
+) -> None:
+    """Emit ``kind`` only when the most recent event for ``task_id`` is not
+    already that kind for the same ``run_id`` (coalesce concurrent ticks)."""
+    cur = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if cur is not None and cur["kind"] == kind:
+        try:
+            prior = _kb._json_dict(cur["payload"])
+        except Exception:
+            prior = {}
+        if prior.get("run_id") == int(run_id):
+            return
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
+def check_retired_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    dry_run: bool = False,
+) -> Optional[str]:
+    """Return ``"retirement_wait"`` while the exact prior worker is still live.
+
+    Called in ``_dispatch_lane_task`` before the claim attempt, for both the
+    ready and review lanes.  When the prior worker is dead or its identity has
+    changed (PID reuse / reboot / new process), the task is released for normal
+    dispatch and a single ``retirement_released`` event is emitted.  Unknown
+    or malformed identity fails closed for this card only (no suppression).
+
+    ``dry_run`` records the event but does not suppress the spawn.
+    """
+    run = _ended_run_with_identity(conn, task_id)
+    if run is None:
+        return None
+    run_id = int(run["id"])
+    exact = _has_exact_identity(conn, run)
+    if exact:
+        if not dry_run:
+            _coalesced_retirement_event(
+                conn, task_id,
+                kind=_RETIREMENT_WAIT_KIND,
+                run_id=run_id,
+                payload={
+                    "run_id": run_id,
+                    "worker_pid": int(run["worker_pid"]),
+                    "worker_started_at": run["worker_started_at"],
+                },
+            )
+        return "retirement_wait"
+    # Dead / changed / unknown identity — release for normal dispatch.
+    if not dry_run:
+        _coalesced_retirement_event(
+            conn, task_id,
+            kind=_RETIREMENT_RELEASED_KIND,
+            run_id=run_id,
+            payload={
+                "run_id": run_id,
+                "worker_pid": int(run["worker_pid"]) if run["worker_pid"] else None,
+                "worker_started_at": run["worker_started_at"],
+                "released_reason": "prior_worker_dead_or_identity_changed",
+            },
+        )
+    return None
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
