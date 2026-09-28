@@ -18,7 +18,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from agent.display import (
     KawaiiSpinner,
@@ -1129,6 +1129,10 @@ def _commit_tool_result(
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    # Retirement evidence is derived from the RAW result, before any spill can replace
+    # the content the loop reads. Skipped when blocked: a blocked call never ran, so it
+    # is not evidence of a handoff. Stamped below, once the row is durable.
+    lifecycle_evidence = None if blocked else _lifecycle_handoff_evidence(function_name, function_result)
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)
@@ -1143,6 +1147,13 @@ def _commit_tool_result(
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
+    # Only a DURABLE result can retire a worker: the evidence is attached after the
+    # canonical append + flush, so a failed flush (which returns above) leaves the
+    # message unmarked and the turn breaks on ``_incremental_persistence_failed``.
+    if lifecycle_evidence is not None:
+        from agent.conversation_loop import _LIFECYCLE_RETIREMENT_KEY
+
+        tool_message[_LIFECYCLE_RETIREMENT_KEY] = lifecycle_evidence
 
     if not blocked:
         # ``tool.completed`` projects AFTER the canonical append + flush so resume can
@@ -1154,6 +1165,44 @@ def _commit_tool_result(
     if isinstance(function_result, str) and len(function_result) >= _LARGE_TOOL_RESULT_TRIM_CHARS:
         agent._trim_after_tool_batch = True
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
+
+
+def _lifecycle_handoff_evidence(function_name: str, function_result: Any) -> Optional[Dict[str, Any]]:
+    """Retirement evidence for a terminal lifecycle result, or None.
+
+    Derived from the RAW result, before ``maybe_persist_tool_result`` (this module) and
+    ``enforce_turn_budget`` (``_finalize_tool_batch``) can replace the content with a
+    ``<persisted-output>`` preview — a preview is not JSON, so the conversation loop
+    could not recognise a genuine handoff whose payload crossed the threshold (a
+    ``kanban_complete`` carrying its whole attachment set is exactly that shape). Only
+    the small JSON object is kept; the spilled body still lives in its spill file.
+
+    Nothing here consults the tool's own prose, so a result cannot assert its own
+    success: ``ok``/``success``/``error``/``task_id`` are all copied from the parsed real
+    result, and the caller attaches it only to a committed row.
+    """
+    from agent.conversation_loop import _TERMINAL_LIFECYCLE_TOOLS
+
+    if function_name not in _TERMINAL_LIFECYCLE_TOOLS:
+        return None
+    payload = function_result
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    evidence = {
+        key: payload[key]
+        for key in ("ok", "success", "task_id")
+        if key in payload
+    }
+    # ``error`` only has to be TRUTHY to veto retirement, so keep a bounded marker rather
+    # than a second reference to a body that may have just been spilled to a preview.
+    if payload.get("error"):
+        evidence["error"] = True
+    return evidence
 
 
 def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: str, env, budget: BudgetConfig) -> dict:

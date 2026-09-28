@@ -73,6 +73,16 @@ _TERMINAL_LIFECYCLE_TOOLS = frozenset({
     "request-changes", "reclaim",
 })
 
+# Retirement evidence recorded by the tool executor (agent/tool_executor.py
+# ::_lifecycle_handoff_evidence) at commit time. An oversized result is replaced by a
+# ``<persisted-output>`` preview — by ``maybe_persist_tool_result`` per result and by
+# ``enforce_turn_budget`` for the whole turn — and the preview is not JSON, so the loop
+# below skipped it and a genuine handoff (a ``kanban_complete`` carrying its whole
+# attachment set is exactly the shape that spills) never retired the worker. The key is
+# ``_``-prefixed: stripped at the provider boundary, never persisted to the transcript,
+# and set only from a real committed result — so no tool output can forge it.
+_LIFECYCLE_RETIREMENT_KEY = "_lifecycle_retirement"
+
 
 def _successful_terminal_lifecycle_tool_result(tool_name: Any, content: Any) -> bool:
     """Return whether a lifecycle tool actually accepted its terminal handoff.
@@ -126,14 +136,30 @@ def _tool_batch_retired(
         if name is None and len(names) == 1 and not call_id:
             name = names[0]
         content = result.get("content")
+        # Prefer the executor's commit-time evidence over the (possibly spilled) content.
+        # Both the success verdict and the task id come from the real result, so every
+        # ownership guard below still applies to it.
+        evidence = result.get(_LIFECYCLE_RETIREMENT_KEY)
+        if not isinstance(evidence, dict) or not evidence:
+            # An empty/non-dict carrier carries no verdict, so defer to the content path
+            # rather than treating it as an authoritative "no task_id" answer.
+            evidence = None
         if worker_task_id:
-            try:
-                payload = json.loads(content) if isinstance(content, str) else content
-            except (TypeError, ValueError):
-                continue
+            if evidence is not None:
+                payload = evidence
+            else:
+                try:
+                    payload = json.loads(content) if isinstance(content, str) else content
+                except (TypeError, ValueError):
+                    continue
             if not isinstance(payload, dict) or payload.get("task_id") != worker_task_id:
                 continue
         if _successful_terminal_lifecycle_tool_result(name, content):
+            return True
+        # Spilled content is a preview, not JSON, so re-run the same predicate against the
+        # executor's evidence. Reusing the predicate (rather than restating the success
+        # fields here) keeps one definition of "this tool actually accepted its handoff".
+        if evidence is not None and _successful_terminal_lifecycle_tool_result(name, evidence):
             return True
     return False
 
