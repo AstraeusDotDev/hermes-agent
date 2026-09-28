@@ -87,7 +87,10 @@ _TERMINAL_LIFECYCLE_TOOLS = frozenset({
 # below skipped it and a genuine handoff (a ``kanban_complete`` carrying its whole
 # attachment set is exactly the shape that spills) never retired the worker. The key is
 # ``_``-prefixed: stripped at the provider boundary, never persisted to the transcript,
-# and set only from a real committed result — so no tool output can forge it.
+# and set only from a real committed result — so no tool output can forge it. It is an
+# EPHEMERAL CONTROL SIGNAL, not a durability claim: the executor attaches it whenever
+# the commit succeeded (which includes an agent with no session DB, where no
+# transcript row exists), and reports durability separately on ``_last_flush_wrote_row``.
 _LIFECYCLE_RETIREMENT_KEY = "_lifecycle_retirement"
 
 

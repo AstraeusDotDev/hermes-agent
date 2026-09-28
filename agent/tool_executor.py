@@ -202,10 +202,12 @@ def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) 
     (``_flush_messages_to_session_db_unlocked``) — is not a failure and must not abort
     a turn that simply has nowhere to persist.
 
-    Retirement evidence needs the stricter question "did a row actually land?", so the
-    durable verdict is recorded separately on ``_last_flush_wrote_row`` and read by
-    ``_commit_tool_result``. Keeping the two answers distinct is what lets a
-    no-persistence agent keep working while never claiming a durable handoff.
+    The two answers stay deliberately separate. "Did the flush fail?" decides whether
+    the batch continues; "did a row actually land?" is recorded on
+    ``_last_flush_wrote_row`` and is a durability fact only. Retirement keys off the
+    first — a committed result retires a worker whether or not a transcript row
+    exists — so a no-persistence agent keeps working, still fails closed on a real
+    write failure, and never has its durability inferred from the sidecar.
     """
     from agent.conversation_loop import _maybe_inject_run_budget_wrapup
     from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
@@ -1174,15 +1176,21 @@ def _commit_tool_result(
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
-    # Only a DURABLE result can retire a worker: the evidence is attached after the
-    # canonical append + flush, so a failed flush (which returns above) leaves the
-    # message unmarked and the turn breaks on ``_incremental_persistence_failed``.
-    # A flush that wrote NO ROW (no session DB / persistence disabled, which returns None
-    # and is not a batch-stopping failure) is equally undurable — claiming a handoff
-    # there would retire a worker on a transcript that does not exist. Compared with
-    # ``is True`` so a stand-in agent whose attribute is a mock object fails closed
-    # rather than reading as a durable write.
-    if lifecycle_evidence is not None and getattr(agent, "_last_flush_wrote_row", False) is True:
+    # Only a COMMITTED result can retire a worker, and "committed" is a different
+    # question from "durably written". Reaching this line already means the flush
+    # did NOT fail: a ``False`` or raising flush returned above, leaving the message
+    # unmarked and breaking the turn on ``_incremental_persistence_failed``. A
+    # ``None`` flush (no session DB / persistence disabled) is explicitly not a
+    # failure — the agent simply has nowhere to persist — and withholding the
+    # sidecar there stranded a genuinely completed worker whose oversized result had
+    # spilled to a preview the loop cannot parse. That is the false negative this
+    # signal exists to prevent.
+    #
+    # So the sidecar is an EPHEMERAL CONTROL SIGNAL, not a durability claim: it says
+    # "this committed result really accepted a terminal handoff for this card".
+    # Whether a session transcript row exists stays reported separately on
+    # ``_last_flush_wrote_row`` and is never asserted by the sidecar's presence.
+    if lifecycle_evidence is not None:
         from agent.conversation_loop import _LIFECYCLE_RETIREMENT_KEY
 
         tool_message[_LIFECYCLE_RETIREMENT_KEY] = lifecycle_evidence

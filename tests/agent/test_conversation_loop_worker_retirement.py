@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -654,16 +655,20 @@ def _lifecycle_result(task_id: str, *, ok: bool = True, pad_chars: int = 0) -> s
     return json.dumps(payload)
 
 
-def _run_sequential(agent, result: str, *, name: str = "kanban_complete", call_id: str = "call_1"):
+def _run_sequential(agent, result: str, *, name: str = "kanban_complete", call_id: str = "call_1",
+                    flush: Any = True):
     """Dispatch ONE real tool call through the production sequential path.
 
     Mirrors the real turn: the assistant(tool_calls) row is appended BEFORE dispatch,
-    which is the anchor ``_tool_batch_retired`` scans back to.
+    which is the anchor ``_tool_batch_retired`` scans back to. ``flush`` is the
+    session-DB verdict the flush reports: ``True`` (a row landed), ``None`` (no
+    session DB / persistence disabled — not a failure), or a raising callable.
     """
     tool_calls = [_mock_tool_call(name=name, call_id=call_id)]
     messages: list = [{"role": "assistant", "content": "", "tool_calls": tool_calls}]
     assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
-    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+    agent._flush_messages_to_session_db = MagicMock(return_value=flush) \
+        if not callable(flush) else flush
     with patch("model_tools.handle_function_call", return_value=result):
         agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
     fake = type("M", (), {"tool_calls": tool_calls})()
@@ -1084,10 +1089,12 @@ def test_flush_returning_none_is_not_durable():
     """``None`` from the flush means NOTHING WAS WRITTEN.
 
     ``_flush_messages_to_session_db_unlocked`` returns ``None`` on the
-    no-session-DB / persistence-disabled paths. Reading that as durable stamped
-    retirement evidence with no DB row behind it. The two verdicts are deliberately
-    SEPARATE: ``None`` must not stop a batch (an agent with no DB still has to work),
-    but it must never be read as a durable write.
+    no-session-DB / persistence-disabled paths. The two verdicts are deliberately
+    SEPARATE: ``None`` must not stop a batch (an agent with no DB still has to
+    work), and ``_last_flush_wrote_row`` must record that no durable write
+    happened. It is NOT what gates retirement — a committed result retires a
+    worker whether or not a transcript row exists - but it is the only honest
+    source for the durability question, so it must never read as a durable write.
     """
     from agent.tool_executor import _flush_session_db_after_tool_progress
 
@@ -1141,11 +1148,18 @@ def test_flush_exception_is_not_durable():
 
 
 def test_no_session_db_agent_does_not_retire(tmp_path, monkeypatch):
-    """Real agent, real persistence-disabled path: no DB row, so no retirement.
+    """Real agent, real persistence-disabled path: no DB row, so no DURABILITY claim.
 
     Deliberately NOT a mock return value — this drives the real
     ``_flush_messages_to_session_db`` (which returns ``None`` for a disabled or absent
     session DB) through the production commit path.
+
+    The unspilled content still retires, and now so does the spilled shape: a
+    ``None`` flush is explicitly NOT a failure, so the commit succeeded and the
+    kanban_complete already mutated the board. Gating retirement on a DB row would
+    strand a genuinely completed worker in a sampling loop — the exact failure the
+    retirement fence exists to prevent. What must stay honest is the DURABILITY
+    claim, which is reported separately and never inferred from the sidecar.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     agent = _make_agent()
@@ -1157,20 +1171,18 @@ def test_no_session_db_agent_does_not_retire(tmp_path, monkeypatch):
     with patch("model_tools.handle_function_call", return_value=_lifecycle_result("work-card")):
         agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
     (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
-    # Nothing durable was written, so the executor must not CLAIM durability...
-    assert _LIFECYCLE_RETIREMENT_KEY not in tool_msg
+    # No row was written, and the code must not claim one was...
     assert getattr(agent, "_last_flush_wrote_row", False) is not True
-    # ...and no batch-stopping failure is invented: an agent with nowhere to persist
-    # must still be able to run its turn.
+    # ...but that is not a batch-stopping failure either: an agent with nowhere to
+    # persist must still be able to run its turn.
     assert getattr(agent, "_incremental_persistence_failed", False) is False
 
-    # The unspilled content is still readable, and the loop's CONTENT path retires from
-    # it. That is pre-existing behavior (verified identical at the base commit) and is
-    # deliberately NOT gated on the session DB: the kanban_complete already mutated the
-    # board, so the handoff really did happen and the worker really should stop. Gating
-    # this on a DB row would strand a genuinely completed worker in a sampling loop —
-    # the exact failure the retirement fence exists to prevent. The fix is therefore
-    # scoped to the durability CLAIM (the sidecar), not to the content verdict.
+    # The commit succeeded, so the ephemeral control signal is attached...
+    assert _LIFECYCLE_RETIREMENT_KEY in tool_msg
+    # ...and the unspilled content retires from it. This is pre-existing behavior
+    # (verified identical at the base commit) and was deliberately never gated on
+    # the session DB: the kanban_complete already mutated the board, so the handoff
+    # really did happen and the worker really should stop.
     fake = type("M", (), {"tool_calls": tool_calls})()
     assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
 
@@ -1264,3 +1276,204 @@ def test_bounded_evidence_never_reaches_session_db_or_provider(spill_home):
     assert len(json.dumps(evidence)) < 1000
     assert _LIFECYCLE_RETIREMENT_KEY not in _sanitize_message(tool_msg, strip_extra_content=False)
     assert _LIFECYCLE_RETIREMENT_KEY not in _db_flush_row(agent, tool_msg, False)
+
+
+# ── No-session-DB spillover: an ephemeral control signal is not a durability claim ──
+#
+# The parent commit attached the retirement sidecar ONLY when a session-DB row
+# landed (``_last_flush_wrote_row is True``). That answers "was this durably
+# written?", which is not the question the loop asks. With no session DB the
+# flush returns ``None`` — explicitly NOT a failure — the batch continues, and a
+# 120K ``kanban_complete`` still spilled to a ``<persisted-output>`` preview. The
+# preview is not JSON, so the content path could not recognise a genuine handoff
+# and the worker kept sampling instead of retiring: a false negative in exactly
+# the case the fence exists to prevent.
+#
+# The repair keeps the two questions apart. The sidecar is attached whenever the
+# commit SUCCEEDED — the flush did not fail — which covers a durable row AND a
+# no-DB agent; durability stays reported separately and is never claimed by the
+# sidecar's presence. A False or raising flush still returns before the attach,
+# so it confers no retirement.
+
+
+def _boom(_messages):
+    raise RuntimeError("disk gone")
+
+
+def test_no_session_db_oversized_own_handoff_still_retires(spill_home):
+    """RED: no session DB + spilled own-card handoff must still retire the worker."""
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", pad_chars=120_000), flush=None
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert PERSISTED_OUTPUT_TAG in tool_msg["content"]  # the spill really happened
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
+
+
+def test_no_session_db_aggregate_spill_also_retires(spill_home, monkeypatch):
+    """The AGGREGATE spill site must be covered without a session DB too.
+
+    Independent of the per-result site: every result stays under the 100K
+    per-result threshold, so only ``enforce_turn_budget`` can stub them.
+    """
+    agent = _make_agent()
+    monkeypatch.setattr(
+        "agent.tool_executor._budget_for_agent",
+        lambda _agent: BudgetConfig(default_result_size=100_000, turn_budget=150_000),
+    )
+    tool_calls = [
+        _mock_tool_call(name="kanban_heartbeat", call_id="c1"),
+        _mock_tool_call(name="kanban_complete", call_id="c2"),
+        _mock_tool_call(name="kanban_heartbeat", call_id="c3"),
+    ]
+    messages: list = [{"role": "assistant", "content": "", "tool_calls": tool_calls}]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    agent._flush_messages_to_session_db = MagicMock(return_value=None)
+    results = {
+        "kanban_heartbeat": _lifecycle_result("work-card", pad_chars=90_000),
+        "kanban_complete": _lifecycle_result("work-card", pad_chars=90_000),
+    }
+    with patch("model_tools.handle_function_call", side_effect=lambda n, a, *rest, **kw: results[n]):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+    complete_msg = next(m for m in messages if m.get("tool_call_id") == "c2")
+    assert PERSISTED_OUTPUT_TAG in complete_msg["content"]  # aggregate spill fired
+    fake = type("M", (), {"tool_calls": tool_calls})()
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
+
+
+def test_no_session_db_retirement_makes_no_durability_claim(spill_home):
+    """The sidecar is an ephemeral control signal, not proof of a written row.
+
+    Retirement and durability are separate questions and the repair must not let
+    one answer for the other: the commit succeeded so the worker retires, but no
+    session transcript row exists, nothing may claim one did, and an agent with
+    nowhere to persist must not be handed an invented batch-stopping failure.
+    """
+    agent = _make_agent()
+    messages, _ = _run_sequential(
+        agent, _lifecycle_result("work-card", pad_chars=120_000), flush=None
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert _LIFECYCLE_RETIREMENT_KEY in tool_msg
+    assert getattr(agent, "_last_flush_wrote_row", False) is not True
+    assert getattr(agent, "_incremental_persistence_failed", False) is False
+
+
+def test_flush_false_confers_no_retirement(spill_home):
+    """A real write failure must NOT confer retirement, spilled or not.
+
+    ``_commit_tool_result`` returns before the sidecar attach, so a failed flush
+    cannot buy a retirement it never earned.
+    """
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", pad_chars=120_000), flush=False
+    )
+    assert not [m for m in messages if m.get("role") == "tool" and _LIFECYCLE_RETIREMENT_KEY in m]
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_flush_exception_confers_no_retirement(spill_home):
+    """A raising flush is a failure too, and never retires."""
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", pad_chars=120_000), flush=_boom
+    )
+    assert not [m for m in messages if m.get("role") == "tool" and _LIFECYCLE_RETIREMENT_KEY in m]
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_no_session_db_oversized_other_task_does_not_retire(spill_home):
+    """Widening the gate must not turn spillover into an ownership bypass."""
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("other-card", pad_chars=120_000), flush=None
+    )
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_no_session_db_oversized_failed_handoff_does_not_retire(spill_home):
+    """A spilled FAILURE stays a failure without a session DB: the model retries."""
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", ok=False, pad_chars=120_000), flush=None
+    )
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_no_session_db_oversized_duplicate_ids_do_not_retire(spill_home):
+    """Two calls claiming one id stay ambiguous without a session DB.
+
+    The evidence path must not become a way around the duplicate-id guard, which
+    exists because attributing a result to a name is unsafe when the pairing is.
+    """
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="kanban_complete", call_id="dup"),
+        _mock_tool_call(name="kanban_heartbeat", call_id="dup"),
+    ]
+    messages: list = [{"role": "assistant", "content": "", "tool_calls": tool_calls}]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    agent._flush_messages_to_session_db = MagicMock(return_value=None)
+    with patch("model_tools.handle_function_call",
+               return_value=_lifecycle_result("work-card", pad_chars=120_000)):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+    fake = type("M", (), {"tool_calls": tool_calls})()
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_no_session_db_oversized_non_lifecycle_tool_does_not_retire(spill_home):
+    """Tool NAME still gates retirement on the widened path."""
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", pad_chars=120_000),
+        name="kanban_comment", flush=None,
+    )
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_parallel_publication_keeps_no_session_db_retirement(spill_home):
+    """The concurrent seam shares ``_commit_tool_result``, so it must agree.
+
+    A fix applied only to the sequential dispatcher would leave a parallel batch
+    retiring with a session DB and stranding the worker without one.
+    """
+    agent = _make_agent()
+    tool_calls = [_mock_tool_call(name="kanban_complete", call_id="c1")]
+    messages: list = [{"role": "assistant", "content": "", "tool_calls": tool_calls}]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    agent._flush_messages_to_session_db = MagicMock(return_value=None)
+    with patch("model_tools.handle_function_call",
+               return_value=_lifecycle_result("work-card", pad_chars=120_000)):
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert PERSISTED_OUTPUT_TAG in tool_msg["content"]
+    fake = type("M", (), {"tool_calls": tool_calls})()
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
+
+
+def test_durable_row_still_carries_evidence_after_widening(spill_home):
+    """The positive durable case is unchanged: a real row keeps its sidecar."""
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", pad_chars=120_000), flush=True
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert _LIFECYCLE_RETIREMENT_KEY in tool_msg
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
+
+
+def test_no_session_db_sidecar_never_reaches_session_db_or_provider(spill_home):
+    """The widened sidecar is bounded and private on the no-DB path too.
+
+    The leak guard must cover the path the repair newly populates, not only the
+    durable path it already covered, and canonical content must be untouched.
+    """
+    from agent.session_persistence import _db_flush_row
+    from agent.transports.chat_completions import _sanitize_message
+
+    agent = _make_agent()
+    messages, _ = _run_sequential(
+        agent, _lifecycle_result("work-card", pad_chars=120_000), flush=None
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert len(json.dumps(tool_msg[_LIFECYCLE_RETIREMENT_KEY])) < 1000
+    rendered = _sanitize_message(tool_msg, strip_extra_content=False) or {}
+    assert _LIFECYCLE_RETIREMENT_KEY not in rendered
+    row = _db_flush_row(agent, tool_msg, False)
+    assert _LIFECYCLE_RETIREMENT_KEY not in row
+    assert row["content"] == tool_msg["content"]  # canonical content unchanged
