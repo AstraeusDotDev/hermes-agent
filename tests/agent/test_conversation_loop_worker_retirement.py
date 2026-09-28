@@ -2,14 +2,21 @@
 
 Dispatcher-owned workers retire only after a SUCCESSFUL terminal lifecycle tool
 result (kanban_complete / kanban_block / kanban_request_review /
-kanban_request_changes / reclaim / schedule, plus the legacy tool-name aliases
-and cronjob_manage).  A failed (error-carrying) result does NOT retire the
+kanban_request_changes / reclaim / schedule, plus legacy tool-name aliases)
+for the worker's own task. A failed (error-carrying) result does NOT retire the
 worker — the model may retry.  The loop stops further model sampling on a
 successful retirement and enters ordinary bounded finalization; it never signals,
 kills, pauses or relaunches the prior process.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from run_agent import AIAgent
 
 from agent.conversation_loop import (
     _TERMINAL_LIFECYCLE_TOOLS,
@@ -22,31 +29,63 @@ from agent.conversation_loop import (
 
 
 def test_accepts_kanban_complete_success():
-    assert _successful_terminal_lifecycle_tool_result("kanban_complete", {"ok": True}) is True
-    assert _successful_terminal_lifecycle_tool_result("kanban_complete", {"ok": True, "summary": "done"}) is True
+    assert (
+        _successful_terminal_lifecycle_tool_result("kanban_complete", {"ok": True})
+        is True
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "kanban_complete", {"ok": True, "summary": "done"}
+        )
+        is True
+    )
 
 
 def test_accepts_kanban_block_success():
-    assert _successful_terminal_lifecycle_tool_result("kanban_block", {"ok": True, "reason": "blocked"}) is True
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "kanban_block", {"ok": True, "reason": "blocked"}
+        )
+        is True
+    )
 
 
 def test_accepts_kanban_request_review_success():
-    assert _successful_terminal_lifecycle_tool_result("kanban_request_review", {"ok": True, "summary": "review"}) is True
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "kanban_request_review", {"ok": True, "summary": "review"}
+        )
+        is True
+    )
 
 
 def test_accepts_kanban_request_changes_success():
-    assert _successful_terminal_lifecycle_tool_result("kanban_request_changes", {"ok": True, "reason": "changes"}) is True
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "kanban_request_changes", {"ok": True, "reason": "changes"}
+        )
+        is True
+    )
 
 
 def test_accepts_request_review_alias_success():
     # Legacy / emitted tool-name aliases use hyphenated forms in some transports.
-    assert _successful_terminal_lifecycle_tool_result("request-review", {"ok": True}) is True
-    assert _successful_terminal_lifecycle_tool_result("request-changes", {"ok": True}) is True
+    assert (
+        _successful_terminal_lifecycle_tool_result("request-review", {"ok": True})
+        is True
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result("request-changes", {"ok": True})
+        is True
+    )
 
 
 def test_accepts_schedule_success_via_success_field():
     # Scheduling tools report {"success": true} rather than {"ok": true}.
-    assert _successful_terminal_lifecycle_tool_result("schedule", {"success": True}) is True
+    assert (
+        _successful_terminal_lifecycle_tool_result("schedule", {"success": True})
+        is True
+    )
 
 
 def test_accepts_reclaim_success():
@@ -55,15 +94,30 @@ def test_accepts_reclaim_success():
 
 def test_accepts_cronjob_manage_success():
     # Cron maintenance never closes the worker's card, even on success.
-    assert _successful_terminal_lifecycle_tool_result("cronjob_manage", {"success": True}) is False
-    assert _successful_terminal_lifecycle_tool_result("cronjob_manage", {"success": True, "count": 0, "jobs": []}) is False
+    assert (
+        _successful_terminal_lifecycle_tool_result("cronjob_manage", {"success": True})
+        is False
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "cronjob_manage", {"success": True, "count": 0, "jobs": []}
+        )
+        is False
+    )
 
 
 def test_cron_list_tool_batch_does_not_retire_worker():
-    call = {"id": "cron-list", "function": {"name": "cronjob_manage", "arguments": '{"action":"list"}'}}
+    call = {
+        "id": "cron-list",
+        "function": {"name": "cronjob_manage", "arguments": '{"action":"list"}'},
+    }
     messages = [
         {"role": "assistant", "tool_calls": [call]},
-        {"role": "tool", "tool_call_id": "cron-list", "content": '{"success": true, "count": 0, "jobs": []}'},
+        {
+            "role": "tool",
+            "tool_call_id": "cron-list",
+            "content": '{"success": true, "count": 0, "jobs": []}',
+        },
     ]
     fake = type("M", (), {"tool_calls": [call]})()
     assert _tool_batch_retired(messages, fake) is False
@@ -74,7 +128,11 @@ def test_worker_only_retires_on_its_own_task_handoff():
     fake = type("M", (), {"tool_calls": [call]})()
     messages = [
         {"role": "assistant", "tool_calls": [call]},
-        {"role": "tool", "tool_call_id": "complete", "content": '{"ok": true, "task_id": "another"}'},
+        {
+            "role": "tool",
+            "tool_call_id": "complete",
+            "content": '{"ok": true, "task_id": "another"}',
+        },
     ]
     assert _tool_batch_retired(messages, fake, worker_task_id="mine") is False
     messages[1]["content"] = '{"ok": true, "task_id": "mine"}'
@@ -84,27 +142,57 @@ def test_worker_only_retires_on_its_own_task_handoff():
 
 
 def test_rejects_tool_error():
-    assert _successful_terminal_lifecycle_tool_result("kanban_complete", {"error": "something"}) is False
-    assert _successful_terminal_lifecycle_tool_result("kanban_block", {"error": "blocked", "ok": True}) is False
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "kanban_complete", {"error": "something"}
+        )
+        is False
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result(
+            "kanban_block", {"error": "blocked", "ok": True}
+        )
+        is False
+    )
 
 
 def test_rejects_non_terminal_tool():
-    assert _successful_terminal_lifecycle_tool_result("kanban_comment", {"ok": True}) is False
-    assert _successful_terminal_lifecycle_tool_result("file_write", {"ok": True}) is False
-    assert _successful_terminal_lifecycle_tool_result("kanban_heartbeat", {"ok": True}) is False
+    assert (
+        _successful_terminal_lifecycle_tool_result("kanban_comment", {"ok": True})
+        is False
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result("file_write", {"ok": True}) is False
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result("kanban_heartbeat", {"ok": True})
+        is False
+    )
 
 
 def test_rejects_unknown_tool():
-    assert _successful_terminal_lifecycle_tool_result("some_unknown_tool", {"ok": True}) is False
+    assert (
+        _successful_terminal_lifecycle_tool_result("some_unknown_tool", {"ok": True})
+        is False
+    )
 
 
 def test_string_content_json_parsed():
-    assert _successful_terminal_lifecycle_tool_result("kanban_complete", '{"ok": true}') is True
-    assert _successful_terminal_lifecycle_tool_result("kanban_complete", '{"ok": false}') is False
+    assert (
+        _successful_terminal_lifecycle_tool_result("kanban_complete", '{"ok": true}')
+        is True
+    )
+    assert (
+        _successful_terminal_lifecycle_tool_result("kanban_complete", '{"ok": false}')
+        is False
+    )
 
 
 def test_malformed_string_content_not_retired():
-    assert _successful_terminal_lifecycle_tool_result("kanban_complete", "not json") is False
+    assert (
+        _successful_terminal_lifecycle_tool_result("kanban_complete", "not json")
+        is False
+    )
 
 
 def test_non_dict_content_after_json_not_retired():
@@ -139,10 +227,19 @@ def test_retires_single_tool_success():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}},
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "name": "kanban_complete", "content": '{"ok": true}'},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "kanban_complete",
+            "content": '{"ok": true}',
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is True
@@ -154,10 +251,19 @@ def test_retires_scheduled_success_via_success_field():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "schedule", "arguments": "{}"}},
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "schedule", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "name": "schedule", "content": '{"success": true}'},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "schedule",
+            "content": '{"success": true}',
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is True
@@ -169,10 +275,19 @@ def test_fails_on_tool_error_not_retired():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}},
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "name": "kanban_complete", "content": '{"error": "fatal"'},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "kanban_complete",
+            "content": '{"error": "fatal"',
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is False
@@ -184,10 +299,19 @@ def test_non_terminal_tool_result_not_retired():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}},
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "name": "kanban_comment", "content": "ok"},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "kanban_comment",
+            "content": "ok",
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is False
@@ -199,12 +323,30 @@ def test_batched_mixed_tools_retires_on_terminal_success():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}},
-                {"id": "call_2", "type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}},
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "name": "kanban_comment", "content": "ok"},
-        {"role": "tool", "tool_call_id": "call_2", "name": "kanban_complete", "content": '{"ok": true}'},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "kanban_comment",
+            "content": "ok",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_2",
+            "name": "kanban_complete",
+            "content": '{"ok": true}',
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is True
@@ -217,11 +359,24 @@ def test_tool_call_id_resolves_name():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "call_a", "type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}},
-                {"id": "call_b", "type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}},
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                },
+                {
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_b", "name": "kanban_complete", "content": '{"ok": true}'},
+        {
+            "role": "tool",
+            "tool_call_id": "call_b",
+            "name": "kanban_complete",
+            "content": '{"ok": true}',
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is True
@@ -233,7 +388,10 @@ def test_single_tool_falls_back_to_names_when_no_id():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}},
+                {
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                },
             ],
         },
         {"role": "tool", "name": "kanban_complete", "content": '{"ok": true}'},
@@ -250,8 +408,14 @@ def test_multiple_tools_without_ids_uses_last_assistant_name():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}},
-                {"type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}},
+                {
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "kanban_complete", "arguments": "{}"},
+                },
             ],
         },
         {"role": "tool", "name": "kanban_complete", "content": '{"ok": true}'},
@@ -262,11 +426,20 @@ def test_multiple_tools_without_ids_uses_last_assistant_name():
 
 def test_unlinked_result_id_cannot_retire_a_multi_tool_batch():
     messages = [
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "comment", "function": {"name": "kanban_comment"}},
-            {"id": "complete", "function": {"name": "kanban_complete"}},
-        ]},
-        {"role": "tool", "tool_call_id": "different", "name": "kanban_complete", "content": '{"ok": true}'},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "comment", "function": {"name": "kanban_comment"}},
+                {"id": "complete", "function": {"name": "kanban_complete"}},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "different",
+            "name": "kanban_complete",
+            "content": '{"ok": true}',
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[0]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is False
@@ -282,10 +455,19 @@ def test_tool_result_after_assistant_message_respected():
             "role": "assistant",
             "content": "",
             "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}},
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                },
             ],
         },
-        {"role": "tool", "tool_call_id": "c1", "name": "kanban_comment", "content": "ok"},
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "name": "kanban_comment",
+            "content": "ok",
+        },
     ]
     fake = type("M", (), {"tool_calls": messages[-2]["tool_calls"]})()
     assert _tool_batch_retired(messages, fake) is False
@@ -313,3 +495,131 @@ def test_terminal_tools_set_contains_aliases():
 
 def test_terminal_tools_set_contains_cronjob_manage():
     assert "cronjob_manage" not in _TERMINAL_LIFECYCLE_TOOLS
+
+
+@pytest.mark.parametrize("max_iterations", [1, 10])
+@pytest.mark.parametrize("micro_enabled", [False, True])
+def test_terminal_handoff_skips_pressure_compaction_and_next_model_call(
+    monkeypatch, max_iterations, micro_enabled
+):
+    """A real conversation tool round must stop before post-tool LLM compaction."""
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "kanban_complete",
+            "description": "Complete a task",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[tool_def]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.model_metadata.get_model_context_length", return_value=256_000),
+        patch(
+            "agent.context_compressor.get_model_context_length", return_value=256_000
+        ),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=max_iterations,
+        )
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._disable_streaming = True
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.max_compression_attempts = 1
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names.add("skill_manage")
+    agent._spawn_background_review = MagicMock()
+    agent._deferred_title_upgrade = MagicMock(ident=None)
+    compressor = MagicMock()
+    compressor.protect_first_n = 3
+    compressor.protect_last_n = 20
+    compressor.threshold_tokens = (
+        90_000  # preflight 33 tokens is safe; post-tool 100k is not
+    )
+    compressor.context_length = 256_000
+    compressor.last_prompt_tokens = 0
+    compressor._verify_compaction_cleared_threshold = False
+    compressor.awaiting_real_usage_after_compression = False
+    compressor.should_compress.side_effect = lambda tokens: tokens >= 90_000
+    compressor.should_compress_info.side_effect = lambda tokens: (
+        tokens >= 90_000,
+        "threshold" if tokens >= 90_000 else None,
+    )
+    compressor.should_compress_preflight.return_value = False
+    compressor.should_defer_preflight_to_real_usage.return_value = False
+    compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor.select_context.return_value = None
+    compressor.get_automatic_compaction_status_message.return_value = ""
+    compressor._micro_compact_enabled = micro_enabled
+    compressor._micro_compact.side_effect = AssertionError(
+        "micro-compaction sampled after handoff"
+    )
+    agent.compression_enabled = True
+    agent.context_compressor = compressor
+
+    call = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="kanban_complete", arguments="{}"),
+    )
+    message = SimpleNamespace(
+        content=None,
+        reasoning_content=None,
+        reasoning=None,
+        tool_calls=[call],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        model="test/model",
+        usage=SimpleNamespace(
+            prompt_tokens=100_000,
+            completion_tokens=1,
+            total_tokens=100_001,
+        ),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        response,
+        AssertionError("model sampled after handoff"),
+    ]
+    agent._compress_context = MagicMock(
+        side_effect=AssertionError("compression sampled after handoff")
+    )
+
+    def fake_execute(assistant_message, messages, *_args):
+        messages.append({
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": assistant_message.tool_calls[0].id,
+            "content": '{"ok": true, "task_id": "work-card"}',
+        })
+
+    agent._execute_tool_calls = fake_execute
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "work-card")
+    with (
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.title_generator.start_title_upgrade") as start_title_upgrade,
+    ):
+        result = agent.run_conversation("finish worker task")
+    assert agent.client.chat.completions.create.call_count == 1
+    assert agent._compress_context.call_count == 0
+    compressor._micro_compact.assert_not_called()
+    agent._spawn_background_review.assert_not_called()
+    start_title_upgrade.assert_not_called()
+    assert result["completed"] is True
+    assert result["final_response"] == "Worker task handoff recorded."
+    assert result.get("turn_exit_reason") == "terminal_lifecycle_tool"
+    assert result["messages"][-1]["role"] == "assistant"

@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
@@ -179,6 +180,18 @@ def run_tool_round(
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
         return _verdict("break")
+
+    # A successful handoff of this worker's own task ends the turn. Check the
+    # canonical tool results before post-tool compression: its summarizer can
+    # sample a model (or end the turn) even when no follow-up answer is needed.
+    worker_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if worker_task_id:
+        from agent.conversation_loop import _tool_batch_retired
+
+        if _tool_batch_retired(messages, assistant_message, worker_task_id=worker_task_id):
+            _turn_exit_reason = "terminal_lifecycle_tool"
+            agent._session_messages = messages
+            return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0

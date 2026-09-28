@@ -1746,14 +1746,8 @@ def _run_conversation_turn(
             if _v.action == "break":
                 break
             if _v.action == "continue":
-                # The lifecycle tool has already recorded the worker's terminal
-                # state.  Do ordinary bounded finalization, but never sample again.
-                worker_task_id = os.environ.get("HERMES_KANBAN_TASK")
-                if worker_task_id and _tool_batch_retired(
-                    s.messages, s.assistant_message, worker_task_id=worker_task_id
-                ):
-                    s._turn_exit_reason = "terminal_lifecycle_tool"
-                    break
+                # Terminal worker handoffs have already been recognized inside
+                # the tool round, before post-tool compaction can sample again.
                 continue
         except Exception as e:
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":

@@ -173,9 +173,16 @@ def _resolve_budget_fallback(
     # dispatcher-owned worker owns the task: an in-process delegate_task child or cron run
     # inherits ``HERMES_KANBAN_TASK`` via os.environ but exhausting ITS budget must not
     # close the parent's run and release its claim (#112817).
+    # Reaching the numerical cap on a successful own-task handoff is not a
+    # timeout: the lifecycle tool already committed the terminal outcome.
     _kanban_task = (
         os.environ.get("HERMES_KANBAN_TASK")
-        if budget_exhausted and is_dispatcher_owned_worker_context() else None
+        if (
+            budget_exhausted
+            and _turn_exit_reason != "terminal_lifecycle_tool"
+            and is_dispatcher_owned_worker_context()
+        )
+        else None
     )
     # If running as a kanban worker, signal the dispatcher that the worker could not complete (rather than
     # treating it as a protocol violation). This applies whether the user-facing fallback came from the
@@ -524,6 +531,12 @@ def finalize_turn(
         logger=logger,
     )
 
+    # The worker's own terminal tool result is already persisted. Close its tool
+    # tail deterministically: asking the model to summarize would run it after
+    # the handoff, while the generic pending-tool fallback would falsely fail it.
+    if _turn_exit_reason == "terminal_lifecycle_tool" and not final_response:
+        final_response = "Worker task handoff recorded."
+
     # A non-interrupted turn that fell out of the loop after a tool result, with no
     # follow-up assistant text, is the Desktop/TUI "silent stop" (#55316, #54756): the
     # composer returns to ready (or keeps spinning) while the durable transcript ends
@@ -573,7 +586,11 @@ def finalize_turn(
         final_response is not None
         and not failed
         and not interrupted
-        and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
+        and (
+            api_call_count < agent.max_iterations
+            or str(_turn_exit_reason).startswith("text_response(")
+            or _turn_exit_reason == "terminal_lifecycle_tool"
+        )
     )
 
     _rollback_interrupted_preflight_display(agent, interrupted)
@@ -583,9 +600,13 @@ def finalize_turn(
 
     _cleanup_errors: List[str] = []
     # The model has answered (or the loop gave up): a title upgrade held back because it shares a
-    # self-hosted endpoint with the main request (#117296) may go out now.
+    # self-hosted endpoint with the main request (#117296) may go out now. A retired
+    # worker must not launch a new auxiliary model call after handing off its task.
     from agent.turn_context import start_deferred_title_upgrade
-    _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
+    if _turn_exit_reason == "terminal_lifecycle_tool":
+        agent._deferred_title_upgrade = None
+    else:
+        _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
     _guarded_cleanup(
         "save_trajectory",
@@ -614,7 +635,12 @@ def finalize_turn(
         if final_response and not interrupted:
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
-        if not interrupted and not failed:
+        # Both changes are required, not alternatives:
+        #   - main added the required `task_id` arg to _micro_compact_after_turn (:292)
+        #   - this branch skips micro-compaction on a terminal_lifecycle_tool exit
+        # Dropping either one is a regression: the 4-arg call raises TypeError, and the
+        # missing guard re-introduces the bug 79dff8a8e75f fixed.
+        if not interrupted and not failed and _turn_exit_reason != "terminal_lifecycle_tool":
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
         agent._persist_session(messages, conversation_history)
 
@@ -756,6 +782,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and _turn_exit_reason != "terminal_lifecycle_tool"
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):

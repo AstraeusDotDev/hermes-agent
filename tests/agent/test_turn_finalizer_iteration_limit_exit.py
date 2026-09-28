@@ -5,6 +5,7 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
+from agent import conversation_loop  # load before home-I/O guard protects test bodies
 from agent.turn_finalizer import finalize_turn
 
 
@@ -114,20 +115,6 @@ def _finalize(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize(
     ("exit_reason", "interrupted", "failed"),
     [
@@ -191,6 +178,35 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_terminal_handoff_at_budget_limit_does_not_record_owner_failure(monkeypatch):
+    """The last model call can hand off successfully; exhaustion is not a timeout."""
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        is_dispatcher_owned_worker_context,
+    )
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER, raising=False)
+    assert is_dispatcher_owned_worker_context() is True
+    record = MagicMock(name="record_budget_failure")
+    monkeypatch.setattr("agent.turn_finalizer._record_kanban_budget_exhausted", record)
+
+    agent = _LimitAgent(max_iterations=1, budget_remaining=0)
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="terminal_lifecycle_tool",
+        api_call_count=1,
+    )
+
+    record.assert_not_called()
+    assert agent._handle_max_iterations_called is False
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "terminal_lifecycle_tool"
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
@@ -371,11 +387,16 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
 
 
 @pytest.mark.parametrize("scope", ["child", "non-owner"])
-def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(monkeypatch, scope):
+def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(
+    monkeypatch, scope
+):
     """An in-process delegate_task child (or cron run) inherits ``HERMES_KANBAN_TASK`` from
     the dispatcher worker; exhausting ITS budget must not record ``timed_out`` against the
     parent's task or release the parent's claim (#112817)."""
-    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
@@ -414,6 +435,8 @@ def test_finalize_turn_starts_the_title_upgrade_the_prologue_held_back():
     ran = threading.Event()
     agent = _LimitAgent()
     agent._deferred_title_upgrade = threading.Thread(target=ran.set, daemon=True)
-    _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=1)
+    _finalize(
+        agent, final_response="done", exit_reason="text_response(1)", api_call_count=1
+    )
     assert ran.wait(timeout=5), "deferred title upgrade never started"
     assert agent._deferred_title_upgrade is None
