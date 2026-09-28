@@ -194,7 +194,19 @@ def _resolve_concurrent_tool_timeout() -> float | None:
 
 def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) -> bool:
     """Flush tool-call progress to the session DB before projecting it to any UI: tool side
-    effects can kill/restart the process before turn-end persistence runs."""
+    effects can kill/restart the process before turn-end persistence runs.
+
+    The return value is the BATCH-CONTROL verdict and keeps its historical contract:
+    only an explicit ``False`` (a real write failure) stops the batch. A ``None``
+    return — the no-session-DB / persistence-disabled path
+    (``_flush_messages_to_session_db_unlocked``) — is not a failure and must not abort
+    a turn that simply has nowhere to persist.
+
+    Retirement evidence needs the stricter question "did a row actually land?", so the
+    durable verdict is recorded separately on ``_last_flush_wrote_row`` and read by
+    ``_commit_tool_result``. Keeping the two answers distinct is what lets a
+    no-persistence agent keep working while never claiming a durable handoff.
+    """
     from agent.conversation_loop import _maybe_inject_run_budget_wrapup
     from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
 
@@ -202,14 +214,19 @@ def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) 
     # this tool result as durable. Already-written rows must never be rewritten later.
     _maybe_inject_run_budget_wrapup(agent, messages)
     _maybe_inject_iteration_budget_warning(agent, messages)
+    agent._last_flush_wrote_row = False
     try:
-        persisted = agent._flush_messages_to_session_db(messages) is not False
-        if not persisted:
-            agent._incremental_persistence_failed = True
-            # The flush recorded any classified cause; default to 'unknown' only if nothing more specific exists.
-            if getattr(agent, "_last_persistence_error_cause", None) is None:
-                agent._last_persistence_error_cause = "unknown"
-        return persisted
+        flushed = agent._flush_messages_to_session_db(messages)
+        if flushed is not False:
+            # True proves a row landed; None means "no DB configured" — neither is a
+            # batch-stopping failure, so non-lifecycle dispatch continues as before.
+            agent._last_flush_wrote_row = flushed is True
+            return True
+        agent._incremental_persistence_failed = True
+        # The flush recorded any classified cause; default to 'unknown' only if nothing more specific exists.
+        if getattr(agent, "_last_persistence_error_cause", None) is None:
+            agent._last_persistence_error_cause = "unknown"
+        return False
     except Exception as exc:
         agent._incremental_persistence_failed = True
         from hermes_state import classify_persistence_error
@@ -1131,8 +1148,18 @@ def _commit_tool_result(
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
     # Retirement evidence is derived from the RAW result, before any spill can replace
     # the content the loop reads. Skipped when blocked: a blocked call never ran, so it
-    # is not evidence of a handoff. Stamped below, once the row is durable.
-    lifecycle_evidence = None if blocked else _lifecycle_handoff_evidence(function_name, function_result)
+    # is not evidence of a handoff. NOT gated on the executor's ``is_error``: that
+    # verdict comes from ``_detect_tool_failure``, whose string branch is a substring
+    # heuristic over the first 500 chars, so an ordinary successful handoff whose
+    # attachment is named ``error``/``failed`` is misclassified — and withholding
+    # evidence there strands a genuinely completed worker, which is the very failure
+    # this fence prevents. The authoritative signal is the PARSED payload: a
+    # denial-shaped result vetoes in ``_lifecycle_handoff_evidence`` below, and every
+    # ok/success contradiction is vetoed by the loop's own predicate.
+    lifecycle_evidence = (
+        None if blocked
+        else _lifecycle_handoff_evidence(function_name, function_result)
+    )
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)
@@ -1150,7 +1177,12 @@ def _commit_tool_result(
     # Only a DURABLE result can retire a worker: the evidence is attached after the
     # canonical append + flush, so a failed flush (which returns above) leaves the
     # message unmarked and the turn breaks on ``_incremental_persistence_failed``.
-    if lifecycle_evidence is not None:
+    # A flush that wrote NO ROW (no session DB / persistence disabled, which returns None
+    # and is not a batch-stopping failure) is equally undurable — claiming a handoff
+    # there would retire a worker on a transcript that does not exist. Compared with
+    # ``is True`` so a stand-in agent whose attribute is a mock object fails closed
+    # rather than reading as a durable write.
+    if lifecycle_evidence is not None and getattr(agent, "_last_flush_wrote_row", False) is True:
         from agent.conversation_loop import _LIFECYCLE_RETIREMENT_KEY
 
         tool_message[_LIFECYCLE_RETIREMENT_KEY] = lifecycle_evidence
@@ -1165,6 +1197,12 @@ def _commit_tool_result(
     if isinstance(function_result, str) and len(function_result) >= _LARGE_TOOL_RESULT_TRIM_CHARS:
         agent._trim_after_tool_batch = True
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
+
+
+# Retirement evidence is a bounded control signal, never a payload carrier. A kanban
+# task id is ``t_`` + 8 hex chars (hermes_cli/kanban_db.py::_new_task_id), so a task_id
+# longer than this is not an id — it is a body being smuggled through the ownership key.
+_MAX_EVIDENCE_TASK_ID_CHARS = 64
 
 
 def _lifecycle_handoff_evidence(function_name: str, function_result: Any) -> Optional[Dict[str, Any]]:
@@ -1193,16 +1231,31 @@ def _lifecycle_handoff_evidence(function_name: str, function_result: Any) -> Opt
             return None
     if not isinstance(payload, dict):
         return None
-    evidence = {
-        key: payload[key]
-        for key in ("ok", "success", "task_id")
-        if key in payload
-    }
+    evidence: dict[str, Any] = {}
+    for key in ("ok", "success"):
+        value = payload.get(key)
+        # Only a real boolean is a verdict. A truthy string/object under ``ok`` is
+        # malformed, not an acceptance — copying it would let an oversized blob ride
+        # the sidecar. Dropping the field makes the predicate below fail closed.
+        if isinstance(value, bool):
+            evidence[key] = value
+    # ``task_id`` is the ownership key and is compared verbatim against the worker's
+    # card, so it must be a SHORT scalar. Kanban ids are ``t_`` + 8 hex chars; anything
+    # longer is a payload smuggling a body through a field the loop treats as an id.
+    task_id = payload.get("task_id")
+    if isinstance(task_id, str) and 0 < len(task_id) <= _MAX_EVIDENCE_TASK_ID_CHARS:
+        evidence["task_id"] = task_id
     # ``error`` only has to be TRUTHY to veto retirement, so keep a bounded marker rather
     # than a second reference to a body that may have just been spilled to a preview.
     if payload.get("error"):
         evidence["error"] = True
-    return evidence
+    # A denied/timed-out approval carries a human-readable ``user_summary`` (it is what
+    # ``_detect_tool_failure`` keys on). That is a real refusal, so it must veto — but
+    # the check belongs on the PARSED payload, not on the executor's substring verdict,
+    # which also fires on an attachment merely NAMED ``error``.
+    if payload.get("user_summary"):
+        evidence["error"] = True
+    return evidence or None
 
 
 def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: str, env, budget: BudgetConfig) -> dict:

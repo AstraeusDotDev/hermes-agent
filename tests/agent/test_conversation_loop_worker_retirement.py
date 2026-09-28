@@ -915,3 +915,352 @@ def _render_for_transport(transport: str, tool_msg: dict) -> str:
     from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
     return json.dumps(_chat_messages_to_responses_input([tool_msg]), default=str)
+
+
+# ── Independent review counterexamples (exact tip ffa9498) ───────────────────
+#
+# An external read-only review of 64b8595..ffa9498 returned REQUEST_CHANGES with
+# four executable probes. Each is pinned here as a contract, not a snapshot.
+
+# A real kanban id shape (``t_`` + 8 hex, hermes_cli/kanban_db.py::_new_task_id).
+CARD = "t_731b564c"
+
+
+def test_contradictory_ok_true_success_false_does_not_retire():
+    """A stale ``ok: true`` beside an explicit ``success: false`` is a REJECTION.
+
+    Both fields are real result contracts (Kanban uses ``ok``, scheduling uses
+    ``success``), so the pair is contradictory rather than merely absent. A single
+    true field must not outvote the other reporting failure.
+    """
+    assert _successful_terminal_lifecycle_tool_result(
+        "kanban_complete",
+        {"ok": True, "success": False, "message": "rejected", "task_id": "work-card"},
+    ) is False
+    # The mirror image is equally a contradiction.
+    assert _successful_terminal_lifecycle_tool_result(
+        "kanban_complete", {"ok": False, "success": True},
+    ) is False
+    # An uncontradicted single-true field is still the documented contract.
+    assert _successful_terminal_lifecycle_tool_result("kanban_complete", {"ok": True}) is True
+    assert _successful_terminal_lifecycle_tool_result("kanban_complete", {"success": True}) is True
+
+
+def test_contradictory_fields_do_not_retire_through_executor_evidence(spill_home):
+    """The evidence path is a second reader of the same contradiction.
+
+    ``_tool_batch_retired`` re-runs the predicate against the executor's evidence when
+    the content is a spill preview, so the veto must hold on BOTH paths.
+    """
+    agent = _make_agent()
+    result = json.dumps({
+        "ok": True, "success": False, "message": "rejected", "task_id": "work-card",
+    })
+    messages, fake = _run_sequential(agent, result, call_id="call_1")
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    # The raw (unspilled) result is contradictory, so no retirement.
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+    assert _successful_terminal_lifecycle_tool_result(
+        "kanban_complete", tool_msg.get(_LIFECYCLE_RETIREMENT_KEY) or {},
+    ) is False
+
+
+def test_error_bearing_payload_withholds_evidence(spill_home):
+    """A REAL refusal must not stamp evidence, whatever the executor's verdict.
+
+    ``ok: true`` plus a real ``error``/``user_summary`` is exactly the shape a
+    partially-applied or denied handoff produces. The authoritative signal is the
+    parsed payload, so both must veto on the evidence path.
+    """
+    from agent.tool_executor import _lifecycle_handoff_evidence
+
+    for payload in (
+        {"ok": True, "error": "board write failed", "task_id": "work-card"},
+        {"ok": True, "user_summary": "approval denied", "task_id": "work-card"},
+    ):
+        raw = json.dumps(payload)
+        evidence = _lifecycle_handoff_evidence("kanban_complete", raw)
+        assert evidence is None or evidence.get("error") is True
+        assert _successful_terminal_lifecycle_tool_result("kanban_complete", evidence or {}) is False
+        assert _successful_terminal_lifecycle_tool_result("kanban_complete", raw) is False
+
+    # Through the real commit path: a refusal never retires. The evidence may still be
+    # present — it carries the bounded ``error`` veto marker — but that marker can only
+    # ever BLOCK retirement, so the contract is the verdict, not the key's presence.
+    agent = _make_agent()
+    messages, fake = _run_sequential(
+        agent,
+        json.dumps({"ok": True, "user_summary": "approval denied", "task_id": "work-card"}),
+        call_id="call_1",
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    evidence = tool_msg.get(_LIFECYCLE_RETIREMENT_KEY)
+    if evidence is not None:
+        assert evidence.get("error") is True
+        assert _successful_terminal_lifecycle_tool_result("kanban_complete", evidence) is False
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_attachment_named_error_does_not_strand_a_completed_worker(spill_home):
+    """REGRESSION GUARD: the substring heuristic must not veto a genuine handoff.
+
+    ``_detect_tool_failure`` classifies any result whose first 500 chars contain the
+    token ``"error"``/``"failed"`` as a failure. A real ``kanban_complete`` returns its
+    whole attachment set, so an ordinary file named ``error`` lands inside that window.
+    Gating retirement on that verdict stranded a genuinely completed worker — the exact
+    failure the fence exists to prevent. Retirement is decided on the parsed payload.
+    """
+    def att(i, name):
+        return {
+            "id": i, "filename": name, "content_type": "application/octet-stream",
+            "size": 4096, "uploaded_by": "agent",
+            # A realistic stored_path is long, and 500 of them push the payload past
+            # the 100K per-result spill threshold — the shape this fence exists for.
+            "stored_path": f"/home/u/.hermes/kanban/attachments/{CARD}/blob-{i:04d}-deliverable",
+        }
+
+    result = json.dumps({
+        "ok": True, "task_id": CARD, "run_id": 7,
+        "attachments": [att(1, "error")] + [att(i, f"p{i}.bin") for i in range(2, 500)],
+    })
+    assert len(result) > 100_000, f"payload must cross the spill threshold, got {len(result)}"
+    # Precondition: the payload really does trip the substring heuristic...
+    from agent.display import _detect_tool_failure
+
+    is_error, _ = _detect_tool_failure("kanban_complete", result)
+    assert is_error is True
+    # ...and really does spill, so the content path is dead and only evidence remains.
+    messages, fake = _run_sequential(_make_agent(), result)
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert PERSISTED_OUTPUT_TAG in tool_msg["content"]
+    # ...yet the worker must still retire.
+    assert _tool_batch_retired(messages, fake, worker_task_id=CARD) is True
+
+
+def test_composite_bridge_id_pairs_with_canonical_result_id():
+    """A Responses bridge publishes ``call_1|fc_1``; the result carries ``call_1``.
+
+    Pairing on the raw id string alone missed this legitimate handoff, so a worker
+    that had genuinely completed kept sampling the model. The canonical composite
+    half is the pairing key (same convention as ``coalesce_tool_call_id``).
+    """
+    call = SimpleNamespace(
+        id="call_1|fc_1", type="function",
+        function=SimpleNamespace(name="kanban_complete", arguments="{}"),
+    )
+    assistant = SimpleNamespace(tool_calls=[call], content=None)
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {
+            "role": "tool", "tool_call_id": "call_1",
+            "content": json.dumps({"ok": True, "task_id": "work-card"}),
+        },
+    ]
+    assert _tool_batch_retired(messages, assistant, worker_task_id="work-card") is True
+
+
+def test_duplicate_call_ids_in_one_batch_are_ambiguous_and_do_not_retire():
+    """Two calls claiming one id cannot be attributed by name.
+
+    ``uniquify_tool_call_ids`` repairs this upstream, but a batch that reaches the
+    loop still ambiguous must not retire on a guess.
+    """
+    calls = [
+        {"id": "dup", "function": {"name": "kanban_complete", "arguments": "{}"}},
+        {"id": "dup", "function": {"name": "kanban_heartbeat", "arguments": "{}"}},
+    ]
+    fake = type("M", (), {"tool_calls": calls})()
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        {
+            "role": "tool", "tool_call_id": "dup",
+            "content": json.dumps({"ok": True, "task_id": "work-card"}),
+        },
+    ]
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is False
+
+
+def test_flush_returning_none_is_not_durable():
+    """``None`` from the flush means NOTHING WAS WRITTEN.
+
+    ``_flush_messages_to_session_db_unlocked`` returns ``None`` on the
+    no-session-DB / persistence-disabled paths. Reading that as durable stamped
+    retirement evidence with no DB row behind it. The two verdicts are deliberately
+    SEPARATE: ``None`` must not stop a batch (an agent with no DB still has to work),
+    but it must never be read as a durable write.
+    """
+    from agent.tool_executor import _flush_session_db_after_tool_progress
+
+    agent = SimpleNamespace(
+        _flush_messages_to_session_db=lambda _messages: None,
+        _incremental_persistence_failed=False,
+        _last_persistence_error_cause=None,
+    )
+    # Not a batch-stopping failure: non-lifecycle dispatch must continue.
+    assert _flush_session_db_after_tool_progress(agent, [], stage="probe") is True
+    assert agent._incremental_persistence_failed is False
+    # ...but nothing was written, so it is not durable evidence.
+    assert agent._last_flush_wrote_row is False
+
+    # An explicit True is both non-failing and durable.
+    ok_agent = SimpleNamespace(
+        _flush_messages_to_session_db=lambda _messages: True,
+        _incremental_persistence_failed=False,
+        _last_persistence_error_cause=None,
+    )
+    assert _flush_session_db_after_tool_progress(ok_agent, [], stage="probe") is True
+    assert ok_agent._incremental_persistence_failed is False
+    assert ok_agent._last_flush_wrote_row is True
+
+    # An explicit False is a real write failure: batch stops, nothing durable.
+    fail_agent = SimpleNamespace(
+        _flush_messages_to_session_db=lambda _messages: False,
+        _incremental_persistence_failed=False,
+        _last_persistence_error_cause=None,
+    )
+    assert _flush_session_db_after_tool_progress(fail_agent, [], stage="probe") is False
+    assert fail_agent._incremental_persistence_failed is True
+    assert fail_agent._last_flush_wrote_row is False
+
+
+def test_flush_exception_is_not_durable():
+    """A raising flush is a failure, and never a durable write."""
+    from agent.tool_executor import _flush_session_db_after_tool_progress
+
+    def boom(_messages):
+        raise RuntimeError("disk gone")
+
+    agent = SimpleNamespace(
+        _flush_messages_to_session_db=boom,
+        _incremental_persistence_failed=False,
+        _last_persistence_error_cause=None,
+    )
+    assert _flush_session_db_after_tool_progress(agent, [], stage="probe") is False
+    assert agent._incremental_persistence_failed is True
+    assert agent._last_flush_wrote_row is False
+
+
+def test_no_session_db_agent_does_not_retire(tmp_path, monkeypatch):
+    """Real agent, real persistence-disabled path: no DB row, so no retirement.
+
+    Deliberately NOT a mock return value — this drives the real
+    ``_flush_messages_to_session_db`` (which returns ``None`` for a disabled or absent
+    session DB) through the production commit path.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    agent = _make_agent()
+    agent._session_db = None
+    agent._persist_disabled = True
+    tool_calls = [_mock_tool_call(name="kanban_complete", call_id="call_1")]
+    messages: list = [{"role": "assistant", "content": "", "tool_calls": tool_calls}]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    with patch("model_tools.handle_function_call", return_value=_lifecycle_result("work-card")):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    # Nothing durable was written, so the executor must not CLAIM durability...
+    assert _LIFECYCLE_RETIREMENT_KEY not in tool_msg
+    assert getattr(agent, "_last_flush_wrote_row", False) is not True
+    # ...and no batch-stopping failure is invented: an agent with nowhere to persist
+    # must still be able to run its turn.
+    assert getattr(agent, "_incremental_persistence_failed", False) is False
+
+    # The unspilled content is still readable, and the loop's CONTENT path retires from
+    # it. That is pre-existing behavior (verified identical at the base commit) and is
+    # deliberately NOT gated on the session DB: the kanban_complete already mutated the
+    # board, so the handoff really did happen and the worker really should stop. Gating
+    # this on a DB row would strand a genuinely completed worker in a sampling loop —
+    # the exact failure the retirement fence exists to prevent. The fix is therefore
+    # scoped to the durability CLAIM (the sidecar), not to the content verdict.
+    fake = type("M", (), {"tool_calls": tool_calls})()
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
+
+
+def test_real_session_db_row_carries_no_evidence_key(tmp_path, monkeypatch, spill_home):
+    """A real SQLite session DB must not receive the private key.
+
+    Uses a genuine ``SessionDB`` (not a mock) so the assertion covers the real
+    row-building path rather than a stubbed return value.
+    """
+    from tests.agent.test_tool_call_incremental_persistence import _attach_real_session_db
+
+    agent = _make_agent()
+    _attach_real_session_db(agent, tmp_path / "state.db", "retirement-evidence-probe")
+    # Dict-shaped tool calls: the real flush JSON-serializes the assistant row, so an
+    # SDK-object stub would fail serialization and exercise the wrong branch.
+    call = {"id": "call_1", "type": "function",
+            "function": {"name": "kanban_complete", "arguments": "{}"}}
+    messages: list = [{"role": "assistant", "content": "", "tool_calls": [call]}]
+    assistant_message = SimpleNamespace(
+        content="", tool_calls=[SimpleNamespace(
+            id="call_1", type="function",
+            function=SimpleNamespace(name="kanban_complete", arguments="{}"),
+        )]
+    )
+    with patch("model_tools.handle_function_call", return_value=_lifecycle_result("work-card")):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    # Durable now, so evidence IS present in memory...
+    assert getattr(agent, "_incremental_persistence_failed", False) is False
+    assert _LIFECYCLE_RETIREMENT_KEY in tool_msg
+    # ...and the real row builder drops the private key while keeping canonical content.
+    from agent.session_persistence import _db_flush_row
+
+    row = _db_flush_row(agent, tool_msg, False)
+    assert _LIFECYCLE_RETIREMENT_KEY not in row
+    assert row["content"] == tool_msg["content"]  # canonical content unchanged
+    # The row really landed in SQLite.
+    from tests.agent.test_tool_call_incremental_persistence import _durable_roles
+
+    assert "tool" in _durable_roles(tmp_path / "state.db", "retirement-evidence-probe")
+
+
+def test_oversized_task_id_is_not_carried_as_evidence():
+    """A 120K-char ``task_id`` is a body, not an id.
+
+    The sidecar exists to survive spillover, so an unbounded field would defeat the
+    bound it was introduced to provide.
+    """
+    from agent.tool_executor import _lifecycle_handoff_evidence
+
+    huge = json.dumps({"ok": True, "task_id": "t" * 120_000})
+    evidence = _lifecycle_handoff_evidence("kanban_complete", huge)
+    assert evidence is None or "task_id" not in evidence
+    assert len(json.dumps(evidence or {})) < 1000
+    # A non-boolean verdict is malformed, not an acceptance, and must not ride along.
+    assert _lifecycle_handoff_evidence(
+        "kanban_complete", json.dumps({"ok": "yes" * 50_000})
+    ) is None
+    # The documented short id still survives.
+    assert _lifecycle_handoff_evidence(
+        "kanban_complete", json.dumps({"ok": True, "task_id": "t_731b564c"})
+    ) == {"ok": True, "task_id": "t_731b564c"}
+
+
+def test_oversized_result_still_retires_valid_own_card_handoff(spill_home):
+    """The bound must not cost the original fix: a truly oversized result still retires.
+
+    Guards against over-correcting into "reject anything big" — the spillover bug
+    this fence exists for was precisely a large genuine handoff failing to retire.
+    """
+    messages, fake = _run_sequential(
+        _make_agent(), _lifecycle_result("work-card", pad_chars=120_000)
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    assert PERSISTED_OUTPUT_TAG in tool_msg["content"]
+    assert _tool_batch_retired(messages, fake, worker_task_id="work-card") is True
+
+
+def test_bounded_evidence_never_reaches_session_db_or_provider(spill_home):
+    """Bounded AND private: the sidecar reaches neither the DB row nor the wire."""
+    from agent.session_persistence import _db_flush_row
+    from agent.transports.chat_completions import _sanitize_message
+
+    agent = _make_agent()
+    messages, _ = _run_sequential(
+        agent, _lifecycle_result("work-card", pad_chars=120_000)
+    )
+    (tool_msg,) = [m for m in messages if m.get("role") == "tool"]
+    evidence = tool_msg[_LIFECYCLE_RETIREMENT_KEY]
+    assert len(json.dumps(evidence)) < 1000
+    assert _LIFECYCLE_RETIREMENT_KEY not in _sanitize_message(tool_msg, strip_extra_content=False)
+    assert _LIFECYCLE_RETIREMENT_KEY not in _db_flush_row(agent, tool_msg, False)

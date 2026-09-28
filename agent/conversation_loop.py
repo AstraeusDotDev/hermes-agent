@@ -18,8 +18,15 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
+# Union of both sides: main added `without_persistence_fields` (used below),
+# this branch added `coalesce_tool_call_id` (used below). Both symbols exist and
+# both are referenced, so taking either side alone would break the module.
 from agent.message_metadata import append_message, without_persistence_fields
-from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
+from agent.message_sanitization import (
+    _repair_tool_call_arguments,
+    _sanitize_surrogates,
+    coalesce_tool_call_id,
+)
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_builder import RUNTIME_ENVIRONMENT_END, RUNTIME_ENVIRONMENT_HEADING
@@ -87,9 +94,11 @@ _LIFECYCLE_RETIREMENT_KEY = "_lifecycle_retirement"
 def _successful_terminal_lifecycle_tool_result(tool_name: Any, content: Any) -> bool:
     """Return whether a lifecycle tool actually accepted its terminal handoff.
 
-    Tool errors are JSON payloads too, so the tool name alone is not sufficient:
-    only the explicit success fields retire the worker.  This deliberately accepts
-    both ``ok`` (Kanban) and ``success`` (scheduling) result contracts.
+    Tool errors are JSON payloads too, so the tool name alone is not sufficient: only
+    an explicit, UNCONTRADICTED success field retires the worker. Both ``ok`` (Kanban)
+    and ``success`` (scheduling) are accepted result contracts, but a payload that sets
+    one true and the other false is self-contradictory — it is a rejection that kept a
+    stale field — and must not retire. Any explicitly false verdict wins over a true one.
     """
     if tool_name not in _TERMINAL_LIFECYCLE_TOOLS:
         return False
@@ -100,6 +109,13 @@ def _successful_terminal_lifecycle_tool_result(tool_name: Any, content: Any) -> 
             return False
     if not isinstance(content, dict) or content.get("error"):
         return False
+    # A denied/timed-out approval carries a human-readable ``user_summary``; that is a
+    # refusal even when the payload also claims ``ok: true`` (the same denial shape the
+    # executor's ``_detect_tool_failure`` recognizes).
+    if content.get("user_summary"):
+        return False
+    if content.get("ok") is False or content.get("success") is False:
+        return False
     return content.get("ok") is True or content.get("success") is True
 
 
@@ -109,18 +125,27 @@ def _tool_batch_retired(
     """Recognize a successful lifecycle handoff for this worker's card."""
     calls = getattr(assistant_message, "tool_calls", ()) or ()
     names_by_id: dict[str, Any] = {}
+    ambiguous_ids: set[str] = set()
     names: list[Any] = []
     for call in calls:
         function = getattr(call, "function", None)
         name = getattr(function, "name", None)
-        call_id = getattr(call, "id", None)
         if isinstance(call, dict):
             function = call.get("function") or {}
             name = function.get("name")
-            call_id = call.get("id")
         names.append(name)
+        # Pair on the CANONICAL id (``coalesce_tool_call_id``: explicit ``call_id``
+        # before ``id``, composite ``call_x|fc_y`` reduced to its call half). A Responses
+        # bridge publishes the assistant row with the composite id while the tool result
+        # carries the canonical half; matching the raw ``id`` string alone misses that
+        # pair and silently drops a genuine handoff.
+        call_id = coalesce_tool_call_id(call)
         if call_id:
-            names_by_id[call_id] = name
+            if call_id in names_by_id:
+                # Two calls claiming one id: neither may be attributed by name.
+                ambiguous_ids.add(call_id)
+            else:
+                names_by_id[call_id] = name
     try:
         start = next(i for i in range(len(messages) - 1, -1, -1)
                      if messages[i].get("role") == "assistant" and messages[i].get("tool_calls"))
@@ -129,11 +154,11 @@ def _tool_batch_retired(
     for result in messages[start + 1:]:
         if not isinstance(result, dict) or result.get("role") != "tool":
             continue
-        call_id = result.get("tool_call_id")
+        call_id = coalesce_tool_call_id({"id": result.get("tool_call_id")})
         # A named result without a matching call ID is still ambiguous in a
         # multi-call batch; never retire on a transport's unlinked name.
-        name = names_by_id.get(call_id) if isinstance(call_id, str) else None
-        if name is None and len(names) == 1 and not call_id:
+        name = names_by_id.get(call_id) if call_id and call_id not in ambiguous_ids else None
+        if name is None and len(names) == 1 and not result.get("tool_call_id"):
             name = names[0]
         content = result.get("content")
         # Prefer the executor's commit-time evidence over the (possibly spilled) content.
