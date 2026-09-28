@@ -2315,12 +2315,9 @@ def _ended_run_with_identity(conn: sqlite3.Connection, task_id: str) -> Optional
     Returns the row (caller must not mutate) or ``None`` when there is no such
     run — no fence applies.
     """
-    # The identity predicates belong in the query, not in the caller: a
-    # completion that also synthesizes an identity-less run row (see
-    # ``kb.complete_task`` -> ``_synthesize_ended_run``) can land in the same
-    # ``ended_at`` second as the real worker run, and ordering alone would then
-    # pick the higher id — the identity-less one — silently releasing a card
-    # whose worker is still alive.
+    # When a later administrative completion synthesizes an identity-less
+    # row, it may share an ended_at second with the earlier live worker.
+    # Filtering on identity before ordering keeps the original run visible.
     return conn.execute(
         "SELECT id, worker_pid, worker_started_at "
         "FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
@@ -2348,7 +2345,10 @@ def _has_exact_identity(conn: sqlite3.Connection, run: sqlite3.Row) -> bool:
     # ``_worker_alive`` with a string fingerprint does the exact-match check
     # (boot_id + start_time).  An integer / unverified row can't confirm
     # exactness, so it is never treated as "still our worker" for suppression.
-    if isinstance(started_at, str) and started_at != UNVERIFIED_WORKER_FINGERPRINT:
+    # Only a complete boot/instantiation witness plus numeric start ticks can
+    # suppress dispatch. A start-only string would fall into _pid_recycled's
+    # legacy comparator and could match a stranger after a reboot.
+    if isinstance(started_at, str) and re.fullmatch(r"[^|\s]+\|[0-9]+", started_at):
         return bool(_worker_alive(pid, started_at))
     return False
 
@@ -2361,22 +2361,16 @@ def _coalesced_retirement_event(
     run_id: int,
     payload: dict,
 ) -> None:
-    """Emit ``kind`` only when the most recent event for ``task_id`` is not
-    already that kind for the same ``run_id`` (coalesce concurrent ticks)."""
-    cur = conn.execute(
-        "SELECT kind, payload FROM task_events "
-        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if cur is not None and cur["kind"] == kind:
-        try:
-            prior = _kb._json_dict(cur["payload"])
-        except Exception:
-            prior = {}
-        if prior.get("run_id") == int(run_id):
-            return
+    """Emit at most one receipt of this kind per ended run, even when comments
+    or another event intervenes between dispatcher ticks."""
     with _kb.write_txn(conn):
-        _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
+        prior = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = ? LIMIT 1",
+            (task_id, run_id, kind),
+        ).fetchone()
+        if prior is None:
+            _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
 
 
 def check_retired_worker(
@@ -2393,7 +2387,7 @@ def check_retired_worker(
     dispatch and a single ``retirement_released`` event is emitted.  Unknown
     or malformed identity fails closed for this card only (no suppression).
 
-    ``dry_run`` records the event but does not suppress the spawn.
+    ``dry_run`` reports the verdict without writing a receipt or claiming.
     """
     run = _ended_run_with_identity(conn, task_id)
     if run is None:
@@ -2465,7 +2459,10 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
+        if (
+            check_respawn_guard(conn, row["id"], lane="review") is None
+            and check_retired_worker(conn, row["id"], dry_run=True) is None
+        ):
             return True
     return False
 

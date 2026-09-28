@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field, fields
@@ -61,6 +62,81 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
+
+
+# Dispatcher-owned workers retire after a lifecycle handoff.  Keep this recognition
+# in the loop (rather than teaching individual tools about process lifecycle) so a
+# failed handoff remains an ordinary tool result and the model gets to retry it.
+_TERMINAL_LIFECYCLE_TOOLS = frozenset({
+    "kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes",
+    "kanban_reclaim", "complete", "block", "schedule", "request-review",
+    "request-changes", "reclaim",
+})
+
+
+def _successful_terminal_lifecycle_tool_result(tool_name: Any, content: Any) -> bool:
+    """Return whether a lifecycle tool actually accepted its terminal handoff.
+
+    Tool errors are JSON payloads too, so the tool name alone is not sufficient:
+    only the explicit success fields retire the worker.  This deliberately accepts
+    both ``ok`` (Kanban) and ``success`` (scheduling) result contracts.
+    """
+    if tool_name not in _TERMINAL_LIFECYCLE_TOOLS:
+        return False
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(content, dict) or content.get("error"):
+        return False
+    return content.get("ok") is True or content.get("success") is True
+
+
+def _tool_batch_retired(
+    messages: List[Dict[str, Any]], assistant_message: Any, *, worker_task_id: Optional[str] = None
+) -> bool:
+    """Recognize a successful lifecycle handoff for this worker's card."""
+    calls = getattr(assistant_message, "tool_calls", ()) or ()
+    names_by_id: dict[str, Any] = {}
+    names: list[Any] = []
+    for call in calls:
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        call_id = getattr(call, "id", None)
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            name = function.get("name")
+            call_id = call.get("id")
+        names.append(name)
+        if call_id:
+            names_by_id[call_id] = name
+    try:
+        start = next(i for i in range(len(messages) - 1, -1, -1)
+                     if messages[i].get("role") == "assistant" and messages[i].get("tool_calls"))
+    except StopIteration:
+        return False
+    for result in messages[start + 1:]:
+        if not isinstance(result, dict) or result.get("role") != "tool":
+            continue
+        call_id = result.get("tool_call_id")
+        # A named result without a matching call ID is still ambiguous in a
+        # multi-call batch; never retire on a transport's unlinked name.
+        name = names_by_id.get(call_id) if isinstance(call_id, str) else None
+        if name is None and len(names) == 1 and not call_id:
+            name = names[0]
+        content = result.get("content")
+        if worker_task_id:
+            try:
+                payload = json.loads(content) if isinstance(content, str) else content
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("task_id") != worker_task_id:
+                continue
+        if _successful_terminal_lifecycle_tool_result(name, content):
+            return True
+    return False
+
 
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py; kept local so importing
 # hermes_state (module-level DEFAULT_DB_PATH) is not forced at load time.
@@ -1670,6 +1746,14 @@ def _run_conversation_turn(
             if _v.action == "break":
                 break
             if _v.action == "continue":
+                # The lifecycle tool has already recorded the worker's terminal
+                # state.  Do ordinary bounded finalization, but never sample again.
+                worker_task_id = os.environ.get("HERMES_KANBAN_TASK")
+                if worker_task_id and _tool_batch_retired(
+                    s.messages, s.assistant_message, worker_task_id=worker_task_id
+                ):
+                    s._turn_exit_reason = "terminal_lifecycle_tool"
+                    break
                 continue
         except Exception as e:
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
