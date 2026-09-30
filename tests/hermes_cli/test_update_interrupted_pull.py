@@ -78,6 +78,10 @@ def checkout(tmp_path, monkeypatch):
     root = tmp_path / "install"
     _git(tmp_path, "clone", "-q", str(origin), str(root))
     _git(root, "reset", "-q", "--hard", "HEAD~1")
+    # The canonical runner already selected the test dependency environment.
+    # Importing main to bind this temporary checkout must not activate the live
+    # install. Entry-order probes below run in separate, unpatched processes.
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda _root: None)
     monkeypatch.setattr("hermes_cli.main.PROJECT_ROOT", root)
     return root, _git(root, "rev-parse", "HEAD"), _git(root, "rev-parse", "origin/main")
 

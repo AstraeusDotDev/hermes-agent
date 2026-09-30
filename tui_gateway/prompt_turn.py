@@ -116,7 +116,8 @@ def _plan_goal_compression_recovery(
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
     queued_prompt_generation: int | None, display_kind: str | None,
-    display_metadata: dict | None) -> tuple[list[str], Any] | None:
+    display_metadata: dict | None, goal_claim: tuple[str, str] | None = None,
+    turn_owner: object | None = None) -> tuple[list[str], Any] | None:
     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
     bypass that once let a second backend run a duplicate turn."""
@@ -138,6 +139,13 @@ def _admit_prompt_turn(
                 int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
                 or session.get("_turn_cancel_requested") or not session.get("running")):
             return None  # a stale dispatch must not release or replace a newer turn
+        if goal_claim is not None:
+            from hermes_cli.goals import _get_session_db, _meta_key
+            with _session_profile_runtime_scope(session):
+                db = _get_session_db()
+                if db is None or db.get_meta(_meta_key(goal_claim[0])) != goal_claim[1]:
+                    session["running"] = False
+                    return None
         if session.get("_closing"):
             session["running"] = False
             session.pop("_submit_user_row", None)
@@ -157,6 +165,9 @@ def _admit_prompt_turn(
         else:
             with contextlib.suppress(Exception):
                 agent.clear_interrupt()
+        # Replay records are created/replaced/cleared during a normal turn. They
+        # are not ownership: a new admission alone replaces this stable token.
+        session["_prompt_turn_owner"] = turn_owner if turn_owner is not None else object()
     if agent is None:
         # A deferred build can finish without attaching an agent (its record was replaced or closed
         # mid-build: ``agent_ready`` set, ``agent`` None, see ``_start_agent_build``).  Every turn source
@@ -1049,6 +1060,7 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    goal_claim: tuple[str, str] | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
@@ -1059,12 +1071,15 @@ def _run_prompt_submit(
         logger.warning(
             "prompt dispatch: session store unavailable for %s — this turn may not persist",
             session.get("session_key") or sid)
+    # The caller carries its own token through admission, never borrows whatever
+    # owner a successor may have installed before admission returns.
+    turn_owner = object()
     admitted = _admit_prompt_turn(
-        sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata)
+        sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata,
+        goal_claim, turn_owner)
     if admitted is None:
         return False
     images, agent = admitted
-    from contextlib import nullcontext
     from gateway.warning_notifications import diagnostic_turn_muted
     from agent.notification_presentation import notification_config_snapshot
     with _session_profile_runtime_scope(session):
@@ -1132,11 +1147,14 @@ def _run_prompt_submit(
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
             with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-                if not st.error_retained:
-                    _clear_inflight_turn(session)
-                _release_hosted_room_turn_slot(session)
+                # A later explicit submit can own the session before old cleanup
+                # unwinds. Stop changes generation, but not this turn's identity.
+                if session.get("_prompt_turn_owner") is turn_owner:
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    if not st.error_retained:
+                        _clear_inflight_turn(session)
+                    _release_hosted_room_turn_slot(session)
             # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.
             # agent.session_id is re-read because compression may have rotated it (an
             # accepted/finished pair whose id changed IS a rotation trace).
@@ -1171,30 +1189,59 @@ def _run_prompt_submit(
             _run_post_turn_followups(rid, sid, session, *followup)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
-    with _routing_provenance_db(session) as routing_db, _sessions_lock:
-        registered = _sessions.get(sid)
-        can_start = not session.get("_closing") and (registered is None or registered is session)
-        if can_start:
-            # Only a registered session is proof the conversation is routed here; an unregistered one may
-            # still run its turn, but its stamp stays (#106459).
-            if registered is session:
+    def publish(worker):
+        with _routing_provenance_db(session) as routing_db, _sessions_lock:
+            registered = _sessions.get(sid)
+            can_start = not session.get("_closing") and (registered is None or registered is session)
+            if can_start and registered is session:
                 _reopen_routed_session_row(routing_db, sid, session)
-        # Stop and publication of the worker handle share history_lock. Recheck after
-        # routing I/O too: admission alone cannot protect the pre-thread startup seam.
-        with (session["history_lock"] if queued_prompt_generation is not None else nullcontext()):
-            current_claim = (queued_prompt_generation is None
-                             or int(session.get("_queued_prompt_generation", 0)) == queued_prompt_generation)
-            can_start = can_start and current_claim and (
-                queued_prompt_generation is None
-                or (not session.get("_turn_cancel_requested") and bool(session.get("running"))))
-            if can_start:
-                can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
-            if not can_start and current_claim and queued_prompt_generation is not None:
-                session["running"] = False
-        if not can_start and queued_prompt_generation is None:
             with session["history_lock"]:
-                session["running"] = False
-    return can_start
+                current_claim = session.get("_prompt_turn_owner") is turn_owner
+                can_start = can_start and current_claim and (
+                    queued_prompt_generation is None or (
+                        int(session.get("_queued_prompt_generation", 0)) == queued_prompt_generation
+                        and not session.get("_turn_cancel_requested") and bool(session.get("running"))))
+
+                def publish_handle():
+                    session["_run_thread"] = worker
+                    session["_run_thread_starting"] = worker
+                    return True
+
+                try:
+                    if can_start:
+                        if goal_claim is None:
+                            can_start = publish_handle()
+                        else:
+                            from hermes_cli.goals import _get_session_db, _meta_key
+
+                            def publish_if_authorized(conn):
+                                row = conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                                                   (_meta_key(goal_claim[0]),)).fetchone()
+                                return bool(row is not None and row[0] == goal_claim[1] and publish_handle())
+
+                            # Idempotent publication of ONE unstarted handle. A DB retry
+                            # rechecks authority; rollback cannot have run any body.
+                            # Stop cannot observe the tentative handle until commit and
+                            # history-lock release. A later goal edit is post-admission.
+                            with _session_profile_runtime_scope(session):
+                                db = _get_session_db()
+                                can_start = db is not None and db._execute_write(publish_if_authorized)
+                    return can_start
+                except BaseException:
+                    can_start = False
+                    raise
+                finally:
+                    if not can_start:
+                        if session.get("_run_thread") is worker:
+                            session.pop("_run_thread", None)
+                            session.pop("_run_thread_starting", None)
+                        if current_claim:
+                            session["running"] = False
+                            _clear_inflight_turn(session)
+
+    # The body (including an inline executor) starts only after publication's
+    # transaction and routing/history locks have all settled and been released.
+    return _start_session_work(run, name=f"prompt-turn-{sid}", session=session, publish=publish) is not None
 
 
 def register(server) -> None:

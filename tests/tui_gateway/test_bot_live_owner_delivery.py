@@ -25,11 +25,19 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
     session = dict(agent=agent, session_key="chat", history_lock=threading.RLock(), running=True)
     retired = []
     noop = lambda *args, **kwargs: None
+
+    def admit(*args):
+        # This fixture replaces admission, so it must install the caller's exact
+        # owner atomically just as admission does; its pair return stays unchanged.
+        with session["history_lock"]:
+            session["_prompt_turn_owner"] = args[-1]
+        return [], agent
+
     submit = rebind(prompt_turn._run_prompt_submit, {
         "threading": threading, "time": time, "logger": logging.getLogger(__name__),
         "_start_session_work": _start_session_work,
         "_sessions_lock": threading.RLock(), "_sessions": {},
-        "_admit_prompt_turn": lambda *args: ([], agent),
+        "_admit_prompt_turn": admit,
         "_session_profile_runtime_scope": lambda session: contextlib.nullcontext(),
         "_emit": noop, "bind_transport": noop, "reset_transport": noop,
         "_current_runtime_session_record": contextvars.ContextVar("refused_turn"),

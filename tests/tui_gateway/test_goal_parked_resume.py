@@ -165,7 +165,9 @@ def test_wake_helper_clears_once_and_leaves_the_judge_to_the_ordinary_turn(env, 
     env.server._maybe_resume_tui_parked_goal("ui-parked", env.session)
     assert clears == [env.manager.state.waiting_until]
     assert len(env.submitted) == 1
-    assert env.submitted[0][1] == {"image_paths": [], "queued_prompt_generation": 0}
+    assert env.submitted[0][1] == {
+        "image_paths": [], "queued_prompt_generation": 0,
+        "goal_claim": (env.manager.session_id, env.goals.load_goal(env.manager.session_id).to_json())}
     assert env.goals.load_goal(env.manager.session_id).turns_used == 2
     judge.assert_not_called()
 
@@ -304,9 +306,11 @@ def test_stop_invalidates_parked_wake_before_worker_launch(env, monkeypatch, bou
     admit = server._admit_prompt_turn
     monkeypatch.setattr(server, "_run_prompt_submit", env.real_submit)
 
-    def start_worker(target, *, name, session):
-        workers.append(name)
+    def start_worker(target, *, name, session, publish=None):
         thread = SimpleNamespace(is_alive=lambda: True)
+        if publish is not None and not publish(thread):
+            return None
+        workers.append(name)
         session["_run_thread"] = thread
         return thread  # no model/network work: exercise the real final admission boundary
 
@@ -415,3 +419,306 @@ def test_profile_scope_and_compression_tip_never_borrow_a_sibling_or_stale_goal(
                     assert current.to_json() == originals[index][0]
     finally:
         set_multiplex_active(False)
+
+
+def _real_worker_fixture(env, monkeypatch):
+    """Keep production admission/publication/finally; replace only model/I/O work."""
+    from contextlib import nullcontext
+    from hermes_cli import plugins
+    from tools import approval, async_delegation
+
+    server, session = env.server, env.session
+    monkeypatch.setattr(server, "_run_prompt_submit", env.real_submit)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda s: True)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
+    monkeypatch.setattr(server, "_routing_provenance_db", lambda s: nullcontext(None))
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *a, **k: "")
+    for name in ("_finish_turn", "_retire_turn_marker", "_emit_settled_session_info",
+                 "_run_post_turn_followups", "_clear_pending"):
+        monkeypatch.setattr(server, name, lambda *a, **k: None)
+    monkeypatch.setattr(plugins, "invoke_hook", lambda *a, **k: None)
+    monkeypatch.setattr(async_delegation, "interrupt_for_session", lambda *a, **k: None)
+    monkeypatch.setattr(approval, "resolve_gateway_approval", lambda *a, **k: None)
+    session["agent"].clear_interrupt = MagicMock()
+    session["agent"].interrupt = MagicMock()
+    entered, release = threading.Event(), threading.Event()
+
+    def prepare(*a):
+        entered.set()
+        assert release.wait(3), "test did not release real worker"
+        return None
+
+    monkeypatch.setattr(server, "_prepare_turn_input", prepare)
+    return entered, release
+
+
+def test_stop_samples_real_worker_published_before_cancellation_lock(env, monkeypatch):
+    entered, release = _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    stop_boundary, allow_stop = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    errors = []
+
+    class PublicationBarrier:
+        def __enter__(self):
+            if threading.current_thread().name == "regression-stop":
+                stop_boundary.set()
+                assert allow_stop.wait(3), "worker publication was not released"
+            lock.acquire()
+
+        def __exit__(self, *a):
+            lock.release()
+
+    session["history_lock"] = PublicationBarrier()
+
+    def stop():
+        try:
+            server._interrupt_session_turn("ui-parked", session)
+        except BaseException as exc:
+            errors.append(exc)
+
+    stopper = threading.Thread(target=stop, name="regression-stop")
+    stopper.start()
+    worker = None
+    try:
+        assert stop_boundary.wait(3), "Stop never reached pre-lock barrier"
+        assert server._maybe_resume_tui_parked_goal("ui-parked", session) is True
+        worker = session["_run_thread"]
+        assert entered.wait(3) and worker.is_alive(), "real publication/start did not fire"
+        allow_stop.set()
+        stopper.join(3)
+        assert not stopper.is_alive() and not errors, errors
+        assert session["_turn_cancel_requested"] is True
+        assert session["_queued_prompt_generation"] == 1
+        assert session["running"] is True, "Stop released a worker it sampled before publication"
+        assert isinstance(session.get("inflight_turn"), dict)
+    finally:
+        allow_stop.set()
+        release.set()
+        stopper.join(3)
+        if worker is not None:
+            worker.join(3)
+            assert not worker.is_alive(), "real worker deadlocked against Stop"
+
+
+def test_stale_worker_finally_preserves_real_explicit_successor(env, monkeypatch):
+    entered, release = _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    assert server._maybe_resume_tui_parked_goal("ui-parked", session) is True
+    old_worker = session["_run_thread"]
+    assert entered.wait(3), "old production worker never entered"
+    successor_entered, successor_release = threading.Event(), threading.Event()
+    successor = []
+    errors = []
+
+    def successor_prepare(*a):
+        successor_entered.set()
+        assert successor_release.wait(3), "successor was not released"
+        return None
+
+    def finish_old(*a):
+        if threading.current_thread() is not old_worker:
+            return
+        try:
+            # Inject a later published owner at the old body's cleanup boundary.
+            # Admission and worker launch remain production code, including Lock.
+            with session["history_lock"]:
+                session["running"] = False
+                server._clear_inflight_turn(session)
+            monkeypatch.setattr(server, "_prepare_turn_input", successor_prepare)
+            error, _ = server._lock_in_submit_turn(
+                "successor", "ui-parked", session, "explicit successor", {}, False, None, None, None)
+            assert error is None
+            assert env.real_submit("successor", "ui-parked", session, "explicit successor") is True
+            successor.append((session["_run_thread"], session["inflight_turn"]))
+            assert successor_entered.wait(3), "real successor publication did not fire"
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(server, "_finish_turn", finish_old)
+    try:
+        assert server._interrupt_session_turn("ui-parked", session) is False
+        release.set()
+        old_worker.join(3)
+        assert not old_worker.is_alive() and not errors, errors
+        assert len(successor) == 1, "successor injection did not fire"
+        thread, inflight = successor[0]
+        assert thread.is_alive()
+        assert session["running"] is True, "old finally released the real explicit successor"
+        assert session["inflight_turn"] is inflight
+    finally:
+        release.set()
+        successor_release.set()
+        old_worker.join(3)
+        for thread, _ in successor:
+            thread.join(3)
+            assert not thread.is_alive(), "successor deadlocked during old cleanup"
+
+
+def test_stop_preserves_published_worker_before_its_body_can_start(env, monkeypatch):
+    _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    ran = []
+    session["running"] = True
+
+    def publish(worker):
+        with session["history_lock"]:
+            session["_run_thread"] = worker
+            session["_run_thread_starting"] = worker
+        assert not worker.is_alive() and not ran
+        assert server._interrupt_session_turn("ui-parked", session) is False
+        assert session["running"] is True, "Stop freed a published pending worker"
+        assert not ran, "body ran before the publication boundary settled"
+        return True
+
+    worker = server._start_session_work(
+        lambda: ran.append("body"), name="pending-publication-regression", session=session,
+        publish=publish)
+    assert worker is session["_run_thread"]
+    worker.join(3)
+    assert not worker.is_alive() and ran == ["body"]
+    assert session.get("_run_thread_starting") is None
+
+
+@pytest.mark.parametrize("settlement", ["retry", "rollback"])
+def test_goal_publication_transaction_never_runs_a_body_before_settlement(env, monkeypatch, settlement):
+    import sqlite3
+
+    entered, release = _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    before = env.goals.load_goal(env.manager.session_id).to_json()
+    db = env.goals._get_session_db()
+    execute = db._execute_write
+    transactions, attempts, handles = [], [], []
+
+    def execute_with_settlement_fault(fn, *args, **kwargs):
+        transactions.append(fn)
+        if len(transactions) != 2:  # successful wait-clearing CAS precedes publication
+            return execute(fn, *args, **kwargs)
+
+        def fault(conn):
+            result = fn(conn)
+            attempts.append(result)
+            assert not entered.is_set(), "worker body ran inside unsettled publication transaction"
+            handles.append(session["_run_thread"])
+            assert not handles[-1].is_alive()
+            if settlement == "rollback":
+                raise RuntimeError("injected publication rollback")
+            if len(attempts) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return result
+
+        return execute(fault, *args, **kwargs)
+
+    monkeypatch.setattr(db, "_execute_write", execute_with_settlement_fault)
+    try:
+        server._maybe_resume_tui_parked_goal("ui-parked", session)
+        assert attempts, "publication settlement injection did not fire"
+        if settlement == "rollback":
+            assert attempts == [True] and not entered.is_set()
+            assert not session.get("_run_thread") and not session.get("_run_thread_starting")
+            assert session["running"] is False
+            assert env.goals.load_goal(env.manager.session_id).to_json() == before
+        else:
+            assert attempts == [True, True] and handles[0] is handles[1]
+            assert entered.wait(3) and handles[0].is_alive()
+    finally:
+        release.set()
+        for worker in set(handles):
+            if worker.ident is not None:
+                worker.join(3)
+                assert not worker.is_alive(), "settlement worker did not unwind"
+
+
+@pytest.mark.parametrize("mutation", ["pause", "replace"])
+@pytest.mark.parametrize("boundary", ["persistence", "admitted", "final-launch"])
+def test_persisted_goal_edit_revokes_real_wake_without_stop(env, monkeypatch, mutation, boundary):
+    from contextlib import contextmanager
+
+    entered, release = _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    edit_requested, edit_done = threading.Event(), threading.Event()
+    edits, errors, launched, injections = [], [], [], []
+    save, admit, start = env.goals.save_goal_if_unchanged, server._admit_prompt_turn, server._start_session_work
+
+    def edit_goal():
+        try:
+            assert edit_requested.wait(3), "persisted edit boundary never fired"
+            newer = env.goals.GoalManager(env.manager.session_id)
+            assert newer.state.waiting_until == 0, "wake CAS did not actually succeed"
+            if mutation == "pause":
+                newer.pause(reason="user revoked the wake without Stop")
+            else:
+                newer.set("replacement goal owns the persisted authority")
+            edits.append(env.goals.load_goal(env.manager.session_id).to_json())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            edit_done.set()
+
+    editor = threading.Thread(target=edit_goal, name="persisted-goal-editor")
+    editor.start()
+
+    def inject():
+        if injections:
+            return
+        injections.append(boundary)
+        assert session["running"] is True
+        assert not session.get("_run_thread"), "edit must precede actual worker publication"
+        edit_requested.set()
+        assert edit_done.wait(3), "persisted edit deadlocked before final launch"
+        assert not errors, errors
+
+    def save_then_edit(*args, **kwargs):
+        saved = save(*args, **kwargs)
+        if saved and boundary == "persistence":
+            inject()
+        return saved
+
+    def admit_then_edit(*args, **kwargs):
+        result = admit(*args, **kwargs)
+        if result is not None and boundary == "admitted":
+            inject()
+        return result
+
+    @contextmanager
+    def routing_boundary(record):
+        if boundary == "final-launch":
+            inject()
+        yield None
+
+    def start_real(*args, **kwargs):
+        worker = start(*args, **kwargs)
+        if worker is not None:
+            launched.append(worker)
+        return worker
+
+    monkeypatch.setattr(env.goals, "save_goal_if_unchanged", save_then_edit)
+    monkeypatch.setattr(server, "_admit_prompt_turn", admit_then_edit)
+    monkeypatch.setattr(server, "_routing_provenance_db", routing_boundary)
+    monkeypatch.setattr(server, "_start_session_work", start_real)
+    try:
+        assert server._maybe_resume_tui_parked_goal("ui-parked", session) is True
+        assert injections == [boundary] and len(edits) == 1, "persisted injection did not fire"
+        assert not session.get("_turn_cancel_requested")
+        assert int(session.get("_queued_prompt_generation", 0)) == 0, "test accidentally used Stop"
+        assert env.goals.load_goal(env.manager.session_id).to_json() == edits[0]
+        assert not launched, "revoked persisted goal launched a stale synthesized worker"
+        assert session["running"] is False
+        assert not any(frame[0] == "status.update" and frame[2]["kind"] == "goal"
+                       for frame in env.emitted)
+        # Pausing/replacing a goal revokes only its synthetic claim, not user authority.
+        error, _ = server._lock_in_submit_turn(
+            "explicit", "ui-parked", session, "legitimate explicit user", {}, False, None, None, None)
+        assert error is None
+        assert env.real_submit("explicit", "ui-parked", session, "legitimate explicit user") is True
+        assert len(launched) == 1 and entered.wait(3) and launched[0].is_alive()
+        assert env.goals.load_goal(env.manager.session_id).to_json() == edits[0]
+    finally:
+        edit_requested.set()
+        release.set()
+        editor.join(3)
+        assert not editor.is_alive(), "persisted editor did not terminate"
+        for worker in launched:
+            worker.join(3)
+            assert not worker.is_alive(), "real prompt worker did not terminate"

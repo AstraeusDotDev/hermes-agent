@@ -314,7 +314,8 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
             if prompt := mgr.next_continuation_prompt():
                 started = bool(_run_prompt_submit(
                     f"__goal_resume__{int(time.time() * 1000)}", sid, session, prompt,
-                    image_paths=[], queued_prompt_generation=generation))
+                    image_paths=[], queued_prompt_generation=generation,
+                    goal_claim=(mgr.session_id, cleared)))
                 if started:
                     _emit("status.update", sid, {"kind": "goal", "text": "Goal wait satisfied — resuming."})
         except Exception as exc:

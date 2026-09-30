@@ -21,8 +21,12 @@ def _session_turn_admission(session: dict):
         yield admitted
 
 
-def _start_session_work(target, *, name: str, session: dict | None = None):
-    """Reserve before spawning; release only after the worker (including cleanup) has unwound."""
+def _start_session_work(target, *, name: str, session: dict | None = None, publish=None):
+    """Reserve once, publish an unstarted handle, then run outside the publication locks.
+
+    ``publish(thread)`` may refuse; its successful return must mean authority is
+    settled. The starting handle counts as live to Stop until start completes.
+    """
     from agent.memory_provider import spawn_context_thread
     from hermes_cli.backend_retirement import retirement
 
@@ -37,13 +41,27 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
 
     try:
         thread = spawn_context_thread(run, name=name)
-        if session is not None:
+        if publish is not None:
+            if not publish(thread):
+                retirement.release()
+                return None
+        elif session is not None:
             session["_run_thread"] = thread
         thread.start()
         return thread
     except BaseException:
+        if session is not None:
+            with session["history_lock"]:
+                if session.get("_run_thread") is locals().get("thread"):
+                    session.pop("_run_thread", None)
+                    session["running"] = False
         retirement.release()
         raise
+    finally:
+        if session is not None:
+            with session["history_lock"]:
+                if session.get("_run_thread_starting") is locals().get("thread"):
+                    session.pop("_run_thread_starting", None)
 
 
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> None:
@@ -637,20 +655,23 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
     """Apply the shared ``session.interrupt`` contract to one claimed session; returns whether the compute-host control
     channel was used. The WS orphan reaper reuses this so a dead client gets the same partial-history/queue semantics."""
     use_compute_host = _session_uses_compute_host(session)
-    should_interrupt = bool(session.get("running"))
-    run_thread_alive = False
-    if use_compute_host:
-        # The host owns the live turn (parent `running` can lag a blocked tool), so let it decide. Gate on
-        # `_compute_host_active`: HostSupervisor.interrupt() calls start(), so a lazy session would spawn a child to interrupt.
-        if should_interrupt or session.get("_compute_host_active"):
-            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
-    else:
-        run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
     with session["history_lock"]:
+        # Publication/start uses this same lock: neither the liveness sample nor
+        # release of an unpublished claim may straddle a newly published worker.
+        should_interrupt = bool(session.get("running"))
+        run_thread_alive = (rt := session.get("_run_thread")) is not None and (
+            session.get("_run_thread_starting") is rt or rt.is_alive())
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+        if not use_compute_host and not run_thread_alive and should_interrupt:
+            session["running"] = False
+            _clear_inflight_turn(session)
+    if use_compute_host:
+        # HostSupervisor.interrupt() starts a child; never invoke it for a lazy session.
+        if should_interrupt or session.get("_compute_host_active"):
+            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     if should_interrupt:
         # Sibling of gateway/run_agent_cache.py::_interrupt_and_clear_session: a user-initiated stop of a
         # live TUI/desktop turn is the same "loop is gone" event for plugins holding per-turn external
@@ -679,11 +700,6 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
             interrupt_for_session(
                 origin_ui_session_id=_lifecycle_own_sid(session, sid), reason="user_stop",
                 parent_session_id=str(getattr(session.get("agent"), "session_id", "") or ""))
-        if not run_thread_alive:
-            with session["history_lock"]:
-                if session.get("running"):
-                    session["running"] = False
-                    _clear_inflight_turn(session)
     _clear_pending(sid)
     with contextlib.suppress(Exception):
         from tools.approval import resolve_gateway_approval
