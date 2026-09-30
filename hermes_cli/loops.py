@@ -620,7 +620,9 @@ def goal_blocks_loop_tick(session_id: str) -> bool:
         from hermes_cli.goals import GoalManager
 
         mgr = GoalManager(session_id=session_id)
-        return mgr.is_active() and not mgr.is_waiting()
+        # Eligibility is observational: the goal's continuation owner must consume
+        # a satisfied barrier, otherwise a TUI poll can lose its only wake signal.
+        return mgr.is_active() and not mgr.is_waiting(clear_satisfied=False)
     except Exception:
         return False
 

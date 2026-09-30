@@ -123,6 +123,31 @@ def test_failed_idle_wake_retries_even_when_a_due_loop_shares_the_poller(env, mo
     assert saved.waiting_until == 0 and saved.turns_used == 2
 
 
+def test_barrier_satisfied_between_goal_and_loop_probes_still_wakes(env, monkeypatch):
+    from hermes_cli.loops import LoopManager
+
+    clock = [time.time()]
+    monkeypatch.setattr(env.goals, "time", SimpleNamespace(
+        time=lambda: clock[0], monotonic=time.monotonic, sleep=time.sleep))
+    env.manager.wait_for_seconds(100, reason="expires between idle probes")
+    deadline = env.manager.state.waiting_until
+    loop = LoopManager(env.manager.session_id)
+    loop.set("unrelated loop", interval_seconds=60)
+    fire_loop = env.server._maybe_fire_tui_loop_tick
+
+    def expire_before_loop(*args):
+        clock[0] = deadline + 1
+        return fire_loop(*args)
+
+    monkeypatch.setattr(env.server, "_maybe_fire_tui_loop_tick", expire_before_loop)
+    _run_empty_poller(env, monkeypatch, real_loop=True)
+    assert len(env.submitted) == 1, "loop probe consumed the barrier without resuming the goal"
+    assert env.submitted[0][0][3] == env.manager.next_continuation_prompt()
+    assert LoopManager(env.manager.session_id).state.ticks_fired == 0
+    saved = env.goals.load_goal(env.manager.session_id)
+    assert saved.waiting_until == 0 and saved.turns_used == 2
+
+
 def test_wake_helper_clears_once_and_leaves_the_judge_to_the_ordinary_turn(env, monkeypatch):
     clears = []
     original = env.goals.GoalState.clear_wait
@@ -208,6 +233,38 @@ def test_failed_submission_retains_the_exact_wait_for_a_successful_retry(env, mo
     assert len(env.submitted) == 1
     assert env.goals.load_goal(env.manager.session_id).waiting_until == 0
     assert env.goals.load_goal(env.manager.session_id).turns_used == 2
+
+
+@pytest.mark.parametrize("mutation", ["pause", "replace"])
+def test_refusal_rollback_does_not_clobber_a_write_after_its_read(env, monkeypatch, mutation):
+    db = env.goals._get_session_db()
+    execute_write = db._execute_write
+    armed = [False]
+    updated = []
+
+    def write_after_rollback_read(fn, *args, **kwargs):
+        if armed[0]:
+            armed[0] = False
+            newer = env.goals.GoalManager(env.manager.session_id)
+            if mutation == "pause":
+                newer.pause(reason="user pause at the persistence boundary")
+            else:
+                newer.set("replacement goal must survive")
+            updated.append(newer.state.to_json())
+        return execute_write(fn, *args, **kwargs)
+
+    def refuse(*args, **kwargs):
+        armed[0] = True
+        return False
+
+    monkeypatch.setattr(db, "_execute_write", write_after_rollback_read)
+    monkeypatch.setattr(env.server, "_run_prompt_submit", refuse)
+    env.server._maybe_resume_tui_parked_goal("ui-parked", env.session)
+    assert updated, "the competing persisted goal write was not exercised"
+    assert env.goals.load_goal(env.manager.session_id).to_json() == updated[0], (
+        "refusal rollback overwrote the concurrent goal command")
+    assert env.session["running"] is False
+    assert env.submitted == []
 
 
 @pytest.mark.parametrize("accepted", [True, False])

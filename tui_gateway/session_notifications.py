@@ -265,10 +265,10 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
 def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
     """Wake a satisfied /goal barrier without judging; True when other ticks must yield.
 
-    ``is_waiting`` owns barrier semantics and lazily clears a satisfied wait. Rewind a
+    ``is_waiting`` owns barrier semantics; consume satisfied waits with persisted CAS. Rewind a
     refused dispatch, but NEVER save the old manager after an accepted dispatch: its
     worker can already have judged, paused, or parked the goal again. A refused wake
-    also owns this poll's boundary: /loop's goal probe would clear its retry barrier.
+    also owns this poll's boundary so other synthetic turns cannot consume the retry.
     """
     with _session_profile_runtime_scope(session):
         with _session_turn_admission(session) as admitted:
@@ -299,10 +299,17 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
                     or state.waiting_on_session is not None or state.waiting_until):
                 return False
             parked = state.to_json()
-            if mgr.is_waiting():
+            if mgr.is_waiting(clear_satisfied=False):
                 return False
+            from hermes_cli.goals import GoalState, save_goal_if_unchanged
+
+            resumed = GoalState.from_json(parked)
+            resumed.clear_wait()
+            if not save_goal_if_unchanged(mgr.session_id, resumed, expected=parked):
+                return True  # a concurrent goal command owns the new state
+            mgr._state = resumed
             handled = True
-            cleared = state.to_json()
+            cleared = resumed.to_json()
             if prompt := mgr.next_continuation_prompt():
                 started = bool(_run_prompt_submit(
                     f"__goal_resume__{int(time.time() * 1000)}", sid, session, prompt, image_paths=[]))
@@ -313,13 +320,11 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
         finally:
             if not started:
                 try:
-                    if mgr is not None and cleared is not None:
-                        from hermes_cli.goals import GoalManager, GoalState
-                        current = GoalManager(mgr.session_id)
-                        # A racing /goal pause/replace owns its new state; don't rewind it.
-                        if current.state is not None and current.state.to_json() == cleared:
-                            current._state = GoalState.from_json(parked)
-                            current._save()
+                    if mgr is not None and parked is not None and cleared is not None:
+                        from hermes_cli.goals import GoalState, save_goal_if_unchanged
+                        # Compare AND restore atomically; a racing goal command wins.
+                        save_goal_if_unchanged(
+                            mgr.session_id, GoalState.from_json(parked), expected=cleared)
                 finally:
                     _notif_release_turn(session)
         return handled
@@ -801,7 +806,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
             last_bot_poll = now
             _poll_bot_live_delivery_guarded(sid, session, now)
         # /goal, /loop and /heartbeat share one claim-under-lock idle boundary.
-        # Probe parked goals FIRST: /loop's goal probe lazily clears satisfied waits.
+        # Probe parked goals FIRST; loop eligibility must leave their barriers intact.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
             last_loop_poll = now
             for what, fire in (("parked goal", _maybe_resume_tui_parked_goal),

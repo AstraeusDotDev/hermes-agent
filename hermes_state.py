@@ -1635,6 +1635,17 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def compare_and_set_meta(self, key: str, expected: str, value: str) -> bool:
+        """Replace an existing metadata value only if it still matches ``expected``.
+
+        Goal-wakeup rollback must not overwrite a concurrent pause/replacement.
+        The SQL predicate and write share one transaction, including across processes.
+        """
+        return self._execute_write(lambda conn: conn.execute(
+            "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+            (value, key, expected),
+        ).rowcount == 1)
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""
