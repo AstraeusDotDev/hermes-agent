@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -261,6 +262,40 @@ def test_goal_resume_after_budget_exhaustion_dispatches_continuation(
     state = GoalManager(session_key).state
     assert state.status == "active"
     assert state.turns_used == 0, "resume must reset the turn budget"
+
+
+def test_parked_wakeup_runs_an_ordinary_turn_without_clobbering_its_new_wait(
+    server, turn_env, monkeypatch,
+):
+    """Exercise the real submit/worker/judge pipeline, even when it finishes inline."""
+    from hermes_cli.goals import GoalManager
+
+    key = "parked-ordinary-turn"
+    mgr = GoalManager(key)
+    mgr.set("finish the isolated task")
+    mgr.wait_for_seconds(1)
+    mgr.state.waiting_until = time.time() - 1
+    mgr._save()
+    seen = []
+
+    def run_conversation(message, **kwargs):
+        seen.append(message)
+        return {"final_response": "waiting for the next check", "completed": True}
+
+    monkeypatch.setattr("hermes_cli.goals.judge_goal",
+                        lambda *a, **k: ("wait", "next check", False, {"seconds": 100}, False))
+    agent = types.SimpleNamespace(session_id=key, run_conversation=run_conversation,
+                                  clear_interrupt=lambda: None)
+    session = _turn_session(agent, key)
+    session["running"] = False
+    server._maybe_resume_tui_parked_goal("sid", session)
+
+    assert seen == [mgr.next_continuation_prompt()]
+    saved = GoalManager(key).state
+    assert saved.waiting_until > time.time() and saved.waiting_reason == "next check"
+    assert saved.turns_used == 1, "only the completed ordinary turn spends judge budget"
+    assert session["running"] is False
+    assert [p["status"] for event, _sid, p in turn_env if event == "message.complete"] == ["complete"]
 
 
 def test_goal_resume_without_goal_stays_exec(server, session):

@@ -141,6 +141,41 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
     assert s["running"] is True
 
 
+def test_parked_goal_claim_prevents_overlapping_loop_and_notification_turns(server, session):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+    from types import SimpleNamespace
+
+    sid, key, s = session
+    s["agent"] = SimpleNamespace(session_id=key)
+    goal = GoalManager(key)
+    goal.set("finish before unrelated automatic work")
+    goal.wait_for_seconds(1)
+    assert goal.state is not None
+    goal.state.waiting_until = time.time() - 1
+    goal._save()
+    loop = LoopManager(key)
+    loop.set("unrelated tick", interval_seconds=60)
+    prompts, competing_claims = [], []
+
+    def submit(rid, sid_, session_, text, **kwargs):
+        prompts.append(text)
+        # Ordinary notification turns use this same lock-backed admission seam.
+        contender = threading.Thread(target=lambda: competing_claims.append(server._notif_claim_turn(s)))
+        contender.start()
+        contender.join(5)
+        assert not contender.is_alive()
+        server._maybe_fire_tui_loop_tick(sid, s)
+        return True
+
+    with patch.object(server, "_run_prompt_submit", submit), patch.object(server, "_emit"):
+        assert server._maybe_resume_tui_parked_goal(sid, s) is True
+    assert prompts == [goal.next_continuation_prompt()]
+    assert competing_claims == [False]
+    assert LoopManager(key).state.ticks_fired == 0
+    assert GoalManager(key).state.turns_used == 0
+
+
 def test_tui_tick_defers_when_running(server, session):
     sid, session_key, s = session
     from hermes_cli.loops import LoopManager, save_loop

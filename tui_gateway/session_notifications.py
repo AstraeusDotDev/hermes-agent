@@ -262,6 +262,69 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
             mgr.abandon_fire()
 
 
+def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
+    """Wake a satisfied /goal barrier without judging; True when other ticks must yield.
+
+    ``is_waiting`` owns barrier semantics and lazily clears a satisfied wait. Rewind a
+    refused dispatch, but NEVER save the old manager after an accepted dispatch: its
+    worker can already have judged, paused, or parked the goal again. A refused wake
+    also owns this poll's boundary: /loop's goal probe would clear its retry barrier.
+    """
+    with _session_profile_runtime_scope(session):
+        with _session_turn_admission(session) as admitted:
+            ready = session.get("agent_ready")
+            if (not admitted or session.get("agent") is None
+                    or (ready is not None and not ready.is_set())
+                    or any(session.get(key) for key in (
+                        "running", "_closing", "_finalized", "_turn_cancel_requested",
+                        "queued_prompt", "queued_prompts", "_auto_continue_scheduled"))):
+                return True
+            session["running"] = True
+        started = handled = False
+        mgr = None
+        parked = cleared = None
+        try:
+            key = _session_lookup_key(session)
+            if not key:
+                return False
+            # Match the post-turn manager/config, but use the agent's compression tip
+            # when session_key has not yet caught up with its rotated session_id.
+            mgr = _active_goal_manager({**session, "session_key": key})
+            if mgr is None:
+                return False
+            state = mgr.state
+            if state.max_turns > 0 and state.turns_used >= state.max_turns:
+                return True
+            if not (state.waiting_on_pid is not None
+                    or state.waiting_on_session is not None or state.waiting_until):
+                return False
+            parked = state.to_json()
+            if mgr.is_waiting():
+                return False
+            handled = True
+            cleared = state.to_json()
+            if prompt := mgr.next_continuation_prompt():
+                started = bool(_run_prompt_submit(
+                    f"__goal_resume__{int(time.time() * 1000)}", sid, session, prompt, image_paths=[]))
+                if started:
+                    _emit("status.update", sid, {"kind": "goal", "text": "Goal wait satisfied — resuming."})
+        except Exception as exc:
+            _notif_log_failure("parked-goal dispatch failed", exc)
+        finally:
+            if not started:
+                try:
+                    if mgr is not None and cleared is not None:
+                        from hermes_cli.goals import GoalManager, GoalState
+                        current = GoalManager(mgr.session_id)
+                        # A racing /goal pause/replace owns its new state; don't rewind it.
+                        if current.state is not None and current.state.to_json() == cleared:
+                            current._state = GoalState.from_json(parked)
+                            current._save()
+                finally:
+                    _notif_release_turn(session)
+        return handled
+
+
 def _loop_route_is_gateway_chat(state) -> bool:
     """A /loop set from a messaging chat carries the gateway's ``route`` (platform + chat_id); its wakeup scanner
     (``gateway/run_goals.py::_loop_wakeup_fire_one``) fires those and skips route-less CLI/TUI loops. Mirror it here
@@ -737,13 +800,16 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
             last_bot_poll = now
             _poll_bot_live_delivery_guarded(sid, session, now)
-        # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
-        # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
+        # /goal, /loop and /heartbeat share one claim-under-lock idle boundary.
+        # Probe parked goals FIRST: /loop's goal probe lazily clears satisfied waits.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
             last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+            for what, fire in (("parked goal", _maybe_resume_tui_parked_goal),
+                               ("loop wakeup", _maybe_fire_tui_loop_tick),
+                               ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
                 try:
-                    fire(sid, session)
+                    if fire(sid, session):
+                        break  # goal wake (including a refusal) owns this poll's boundary
                 except Exception as tick_exc:
                     _notif_log_failure(f"{what} poll failed", tick_exc)
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
