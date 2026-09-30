@@ -27,6 +27,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", home)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
     emitted, submitted = [], []
+    real_submit = server._run_prompt_submit
     monkeypatch.setattr(server, "_emit", lambda *a: emitted.append(a))
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: submitted.append((a, k)) or True)
     ready = threading.Event()
@@ -43,7 +44,7 @@ def env(tmp_path, monkeypatch):
     mgr.state.turns_used = 2
     mgr._save()
     yield SimpleNamespace(server=server, goals=goals, session=session, manager=mgr,
-                          submitted=submitted, emitted=emitted, home=home)
+                          submitted=submitted, emitted=emitted, home=home, real_submit=real_submit)
     goals._DB_CACHE.clear()
     server._sessions.clear()
     __import__("tui_gateway.server_requests", fromlist=["x"]).reset_for_tests()
@@ -164,7 +165,7 @@ def test_wake_helper_clears_once_and_leaves_the_judge_to_the_ordinary_turn(env, 
     env.server._maybe_resume_tui_parked_goal("ui-parked", env.session)
     assert clears == [env.manager.state.waiting_until]
     assert len(env.submitted) == 1
-    assert env.submitted[0][1] == {"image_paths": []}
+    assert env.submitted[0][1] == {"image_paths": [], "queued_prompt_generation": 0}
     assert env.goals.load_goal(env.manager.session_id).turns_used == 2
     judge.assert_not_called()
 
@@ -287,6 +288,80 @@ def test_dispatch_never_overwrites_a_newer_goal_state(env, monkeypatch, accepted
     env.server._maybe_resume_tui_parked_goal("ui-parked", env.session)
     assert env.goals.load_goal(env.manager.session_id).to_json() == updated[0]
     assert env.session["running"] is accepted
+
+
+@pytest.mark.parametrize("boundary", ["persistence", "admitted"])
+@pytest.mark.parametrize("successor", ["none", "user", "replacement"])
+def test_stop_invalidates_parked_wake_before_worker_launch(env, monkeypatch, boundary, successor):
+    server, session = env.server, env.session
+    before = env.goals.load_goal(env.manager.session_id).to_json()
+    session["agent"].clear_interrupt = MagicMock()
+    session["agent"].interrupt = MagicMock()
+    workers = []
+    injected = []
+    newer = []
+    save = env.goals.save_goal_if_unchanged
+    admit = server._admit_prompt_turn
+    monkeypatch.setattr(server, "_run_prompt_submit", env.real_submit)
+
+    def start_worker(target, *, name, session):
+        workers.append(name)
+        thread = SimpleNamespace(is_alive=lambda: True)
+        session["_run_thread"] = thread
+        return thread  # no model/network work: exercise the real final admission boundary
+
+    monkeypatch.setattr(server, "_start_session_work", start_worker)
+
+    def stop_then_successor():
+        if injected:
+            return
+        injected.append(boundary)
+        assert session["running"] is True
+        assert not session.get("_run_thread")
+        assert server._interrupt_session_turn("ui-parked", session, request_id="real-stop") is False
+        assert session["_turn_cancel_requested"] is True
+        assert session["_queued_prompt_generation"] == 1
+        assert session["running"] is False
+        if successor == "replacement":
+            replacement = env.goals.GoalManager(env.manager.session_id)
+            replacement.set("new goal must survive the cancelled wake")
+            newer.append(replacement.state.to_json())
+        if successor != "none":
+            err, _ = server._lock_in_submit_turn(
+                "new-user", "ui-parked", session, "explicit new user prompt", {}, False, None, None, None)
+            assert err is None
+            assert session["_turn_cancel_requested"] is False
+            assert env.real_submit("new-user", "ui-parked", session, "explicit new user prompt") is True
+            newer.append(session["inflight_turn"])
+
+    def save_then_stop(*args, **kwargs):
+        saved = save(*args, **kwargs)
+        if saved and boundary == "persistence":
+            stop_then_successor()
+        return saved
+
+    def admit_then_stop(*args, **kwargs):
+        admitted = admit(*args, **kwargs)
+        if admitted is not None and boundary == "admitted":
+            stop_then_successor()
+        return admitted
+
+    monkeypatch.setattr(env.goals, "save_goal_if_unchanged", save_then_stop)
+    monkeypatch.setattr(server, "_admit_prompt_turn", admit_then_stop)
+    assert server._maybe_resume_tui_parked_goal("ui-parked", session) is True
+    assert injected == [boundary], "real Stop injection did not fire"
+    print({"boundary": boundary, "successor": successor, "stop_injected": injected,
+           "workers": workers, "executable": sys.executable, "python": sys.version,
+           "submit_source": env.real_submit.__code__.co_filename,
+           "stop_source": server._interrupt_session_turn.__code__.co_filename})
+    assert len(workers) == (0 if successor == "none" else 1), "cancelled parked wake launched a worker"
+    assert session["running"] is (successor != "none"), "stale wake released a newer user turn's claim"
+    if successor != "none":
+        assert session["inflight_turn"] is newer[-1]
+    assert env.goals.load_goal(env.manager.session_id).to_json() == (
+        newer[0] if successor == "replacement" else before)
+    assert not any(frame[0] == "status.update" and frame[2]["kind"] == "goal"
+                   for frame in env.emitted)
 
 
 def test_profile_scope_and_compression_tip_never_borrow_a_sibling_or_stale_goal(env, monkeypatch, tmp_path):

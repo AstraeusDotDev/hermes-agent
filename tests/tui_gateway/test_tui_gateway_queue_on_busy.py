@@ -774,7 +774,9 @@ def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch)
     original_run = server._run_prompt_submit
 
     def stop_before_run(*args, **kwargs):
-        session["_queued_prompt_generation"] = 1
+        server._interrupt_session_turn("sid", session, request_id="queue-stop")
+        assert session["_turn_cancel_requested"] is True
+        assert session["_queued_prompt_generation"] == 1
         return original_run(*args, **kwargs)
 
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)

@@ -145,7 +145,8 @@ def _turn_session(agent, session_key):
         "agent": agent,
         "session_key": session_key,
         "history": [],
-        "history_lock": threading.Lock(),
+        # The inline worker re-enters turn helpers before launch releases the lock.
+        "history_lock": threading.RLock(),
         "history_version": 0,
         "running": True,
         "attached_images": [],

@@ -127,14 +127,18 @@ def _admit_prompt_turn(
             session.get("session_key") or sid,
             getattr(ownership_refusal, "reason", None) or "refused")
         with session["history_lock"]:
-            session["running"] = False
-            session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
+            if (queued_prompt_generation is None
+                    or int(session.get("_queued_prompt_generation", 0)) == queued_prompt_generation):
+                session["running"] = False
+                session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
         _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:
-        if session.get("_closing") or (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
+        if queued_prompt_generation is not None and (
+                int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+                or session.get("_turn_cancel_requested") or not session.get("running")):
+            return None  # a stale dispatch must not release or replace a newer turn
+        if session.get("_closing"):
             session["running"] = False
             session.pop("_submit_user_row", None)
             return None
@@ -1060,6 +1064,7 @@ def _run_prompt_submit(
     if admitted is None:
         return False
     images, agent = admitted
+    from contextlib import nullcontext
     from gateway.warning_notifications import diagnostic_turn_muted
     from agent.notification_presentation import notification_config_snapshot
     with _session_profile_runtime_scope(session):
@@ -1174,10 +1179,21 @@ def _run_prompt_submit(
             # still run its turn, but its stamp stays (#106459).
             if registered is session:
                 _reopen_routed_session_row(routing_db, sid, session)
-            can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
-    if not can_start:
-        with session["history_lock"]:
-            session["running"] = False
+        # Stop and publication of the worker handle share history_lock. Recheck after
+        # routing I/O too: admission alone cannot protect the pre-thread startup seam.
+        with (session["history_lock"] if queued_prompt_generation is not None else nullcontext()):
+            current_claim = (queued_prompt_generation is None
+                             or int(session.get("_queued_prompt_generation", 0)) == queued_prompt_generation)
+            can_start = can_start and current_claim and (
+                queued_prompt_generation is None
+                or (not session.get("_turn_cancel_requested") and bool(session.get("running"))))
+            if can_start:
+                can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
+            if not can_start and current_claim and queued_prompt_generation is not None:
+                session["running"] = False
+        if not can_start and queued_prompt_generation is None:
+            with session["history_lock"]:
+                session["running"] = False
     return can_start
 
 

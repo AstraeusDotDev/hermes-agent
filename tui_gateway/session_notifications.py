@@ -280,6 +280,7 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
                         "queued_prompt", "queued_prompts", "_auto_continue_scheduled"))):
                 return True
             session["running"] = True
+            generation = int(session.get("_queued_prompt_generation", 0))
         started = handled = False
         mgr = None
         parked = cleared = None
@@ -312,7 +313,8 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
             cleared = resumed.to_json()
             if prompt := mgr.next_continuation_prompt():
                 started = bool(_run_prompt_submit(
-                    f"__goal_resume__{int(time.time() * 1000)}", sid, session, prompt, image_paths=[]))
+                    f"__goal_resume__{int(time.time() * 1000)}", sid, session, prompt,
+                    image_paths=[], queued_prompt_generation=generation))
                 if started:
                     _emit("status.update", sid, {"kind": "goal", "text": "Goal wait satisfied — resuming."})
         except Exception as exc:
@@ -326,7 +328,10 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> bool:
                         save_goal_if_unchanged(
                             mgr.session_id, GoalState.from_json(parked), expected=cleared)
                 finally:
-                    _notif_release_turn(session)
+                    with session["history_lock"]:
+                        # Stop invalidated this claim; a newer user's turn owns running now.
+                        if int(session.get("_queued_prompt_generation", 0)) == generation:
+                            session["running"] = False
         return handled
 
 
