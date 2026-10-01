@@ -105,6 +105,67 @@ def _batch(parent, *children):
     )
 
 
+def test_opt_in_hard_cap_rejects_third_child_across_calls(tmp_path, monkeypatch):
+    """Overlapping calls to one profile may run only two children at once."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  max_concurrent_children: 2\n  hard_child_cap: 2\n  max_spawn_depth: 1\n",
+        encoding="utf-8",
+    )
+    from tools import delegate_tool
+
+    started = {name: threading.Event() for name in ("first", "second", "third", "fourth")}
+    release = {name: threading.Event() for name in started}
+    results = {}
+    active = 0
+    high_water = 0
+    count_lock = threading.Lock()
+
+    def fake_run(*, task_index, goal, **_kwargs):
+        nonlocal active, high_water
+        with count_lock:
+            active += 1
+            high_water = max(high_water, active)
+        started[goal].set()
+        try:
+            assert release[goal].wait(10), f"{goal} was not released"
+            return {"task_index": task_index, "status": "completed"}
+        finally:
+            with count_lock:
+                active -= 1
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run)
+
+    def run_named(name):
+        batch = _batch(_Parent(), _ControlledChild())
+        batch.task_list[0]["goal"] = name
+        results[name] = batch.run_child(*batch.children[0])
+
+    threads = {name: threading.Thread(target=run_named, args=(name,)) for name in started}
+    try:
+        threads["first"].start()
+        threads["second"].start()
+        assert started["first"].wait(3)
+        assert started["second"].wait(3)
+        threads["third"].start()
+        threads["third"].join(3)
+        assert not threads["third"].is_alive()
+        assert not started["third"].is_set()
+        assert results["third"]["status"] == "error"
+        assert "hard_child_cap=2" in results["third"]["error"]
+        release["first"].set()
+        threads["first"].join(3)
+        threads["fourth"].start()
+        assert started["fourth"].wait(3)
+        assert high_water == 2
+    finally:
+        for gate in release.values():
+            gate.set()
+        for thread in threads.values():
+            if thread.ident is not None:
+                thread.join(5)
+
+
 @pytest.fixture
 def registry_state(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

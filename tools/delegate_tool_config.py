@@ -107,6 +107,26 @@ def _get_max_concurrent_children() -> int:
         )
     return result
 
+
+def _get_hard_child_cap() -> Optional[int]:
+    """Opt-in aggregate running-child cap for one Hermes home; absent means unchanged behavior.
+
+    This is deliberately profile configuration only, with no environment fallback.
+    A malformed configured cap fails closed instead of silently disabling the gate.
+    """
+    raw = _cfg().get("hard_child_cap")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        cap = int(raw)
+        if cap < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("delegation.hard_child_cap must be a positive integer") from None
+    return cap
+
 def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""

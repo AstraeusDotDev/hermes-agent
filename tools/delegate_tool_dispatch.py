@@ -8,9 +8,11 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import time
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, finish_delegation_unit
@@ -21,8 +23,33 @@ from tools.delegate_tool_progress import (
 )
 from tools.delegate_tool_registry import _capture_gateway_steer_authority
 from tools.delegate_tool_results import _finalize_child_results
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
+
+
+def _take_hard_child_slot(cap: int) -> Optional[int]:
+    """Take one profile-local child permit across threads and Linux processes.
+
+    Each slot is a separate advisory file lock.  A process crash closes its file
+    descriptors and releases permits automatically.  Only profiles that opt in
+    create this directory; all existing profiles retain their current behavior.
+    """
+    import fcntl  # Linux-only opt-in; other profiles must still import this module on Windows.
+    slot_dir = Path(get_hermes_home()) / "cache" / "delegation" / "hard-child-cap"
+    slot_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    for index in range(cap):
+        fd = os.open(slot_dir / f"slot-{index}.lock", flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            os.close(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+    return None
 
 
 @dataclass
@@ -59,7 +86,26 @@ class _Batch:
 
     def run_child(self, i: int, task: Dict[str, Any], child: Any) -> Dict[str, Any]:
         from tools.delegate_tool import _run_single_child
-        return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        from tools.delegate_tool_config import _get_hard_child_cap
+        cap = _get_hard_child_cap()
+        if cap is None:
+            return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        fd = _take_hard_child_slot(cap)
+        if fd is None:
+            _detach_child(self.parent_agent, child)
+            with _quiet("Hard-cap rejected child close failed: %s"):
+                child.close()
+            return _fabricated_entry(
+                i, "error", f"delegation.hard_child_cap={cap} is at capacity; retry after a child finishes", child,
+            )
+        try:
+            return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        finally:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def _announce_batch(parent_agent, n_tasks: int, live_deleg_id: Optional[str]) -> None:
