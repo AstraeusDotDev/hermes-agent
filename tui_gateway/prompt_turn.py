@@ -1150,6 +1150,10 @@ def _run_prompt_submit(
                 # A later explicit submit can own the session before old cleanup
                 # unwinds. Stop changes generation, but not this turn's identity.
                 if session.get("_prompt_turn_owner") is turn_owner:
+                    # RPC claims install task context before worker ownership is
+                    # refreshed. Retire ours before exposing idle admission.
+                    if st.receipt_committed:
+                        session.pop("_hosted_room_task", None)
                     session["running"] = False
                     session["last_active"] = time.time()
                     if not st.error_retained:
@@ -1174,7 +1178,6 @@ def _run_prompt_submit(
                 with session["history_lock"]:
                     if session.get("_active_turn_marker_key") == st.marker_key:
                         session.pop("_active_turn_marker_key", None)
-                    session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
         return st.result, goal_followup

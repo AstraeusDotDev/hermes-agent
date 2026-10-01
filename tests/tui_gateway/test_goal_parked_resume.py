@@ -452,6 +452,89 @@ def _real_worker_fixture(env, monkeypatch):
     return entered, release
 
 
+def test_hosted_cleanup_preserves_successor_rpc_claim_before_worker_admission(env, monkeypatch):
+    """RPC claims precede worker owner tokens; old cleanup cannot erase their task."""
+    from tui_gateway import hosted_room_member_activity
+
+    entered, release = _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    cleanup_entered, cleanup_release = threading.Event(), threading.Event()
+    old_task = {"task_id": "old-task", "room_id": "room"}
+    new_task = {"task_id": "successor-task", "room_id": "room"}
+    errors, activity = [], []
+    worker = None
+
+    def retire_marker(*a):
+        cleanup_entered.set()
+        if not cleanup_release.wait(3):
+            errors.append("old final cleanup was not released")
+
+    monkeypatch.setattr(server, "_retire_turn_marker", retire_marker)
+    monkeypatch.setattr(hosted_room_member_activity, "emit_room_member_activity",
+                        lambda task, **kw: activity.append((task, kw)) or True)
+    try:
+        err, _ = server._lock_in_submit_turn(
+            "old", "ui-parked", session, "old hosted turn", {}, False, None, old_task, None)
+        assert err is None
+        assert env.real_submit("old", "ui-parked", session, "old hosted turn") is True
+        worker = session["_run_thread"]
+        assert entered.wait(3), "old production worker never entered"
+        owner = session["_prompt_turn_owner"]
+        release.set()
+        assert cleanup_entered.wait(3), "old final cleanup injection did not fire"
+        assert worker.is_alive() and session["running"] is False
+        # Exercise the real RPC claim while B's deferred agent build has not yet
+        # reached worker admission. Persistence/build/model I/O are outside this seam.
+        err, _ = server._lock_in_submit_turn(
+            "new", "ui-parked", session, "successor hosted turn", {}, False, None, new_task, None)
+        assert err is None
+        claimed_task = session["_hosted_room_task"]
+        assert claimed_task == new_task
+        assert session["_prompt_turn_owner"] is owner, "RPC claim unexpectedly refreshed worker ownership"
+        cleanup_release.set()
+        worker.join(3)
+        assert not worker.is_alive() and not errors, errors
+        assert session.get("_hosted_room_task") is claimed_task, "old cleanup erased successor task identity"
+        assert session["running"] is True
+        assert hosted_room_member_activity.project_room_member_activity({
+            "method": "event", "params": {"type": "tool.start", "session_id": "ui-parked",
+                                         "payload": {"name": "successor-tool"}}},
+            {"ui-parked": session}) is True
+        assert activity[0][0] is claimed_task
+        assert activity[0][1]["kind"] == "tool.started"
+    finally:
+        release.set()
+        cleanup_release.set()
+        if worker is not None:
+            worker.join(3)
+            assert not worker.is_alive(), "old production worker leaked"
+
+
+def test_owned_hosted_completion_retires_task_before_idle(env, monkeypatch):
+    entered, release = _real_worker_fixture(env, monkeypatch)
+    server, session = env.server, env.session
+    worker = None
+    try:
+        err, _ = server._lock_in_submit_turn(
+            "owned", "ui-parked", session, "owned hosted turn", {}, False, None,
+            {"task_id": "owned-task"}, None)
+        assert err is None
+        assert env.real_submit("owned", "ui-parked", session, "owned hosted turn") is True
+        worker = session["_run_thread"]
+        assert entered.wait(3), "owned production worker never entered"
+        release.set()
+        worker.join(3)
+        assert not worker.is_alive()
+        assert session["running"] is False
+        assert "_hosted_room_task" not in session
+        assert not session.get("inflight_turn")
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(3)
+            assert not worker.is_alive(), "owned production worker leaked"
+
+
 def test_stop_samples_real_worker_published_before_cancellation_lock(env, monkeypatch):
     entered, release = _real_worker_fixture(env, monkeypatch)
     server, session = env.server, env.session
