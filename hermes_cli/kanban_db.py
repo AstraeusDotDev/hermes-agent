@@ -1141,6 +1141,30 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Immutable, typed resource intent for a card: how much of what it needs, how
+-- it is selected, and the canonical hashed form a dispatcher uses to admit it.
+-- ``card_id`` is TEXT because ``tasks.id`` is ``TEXT PRIMARY KEY`` (see above) --
+-- an INTEGER foreign key would never match a real card, e.g. 't_b435e9bb'.
+-- One row per (card, kind): re-requesting the same kind updates in place via
+-- ``INSERT ... ON CONFLICT`` at the call site, and the unique index is what
+-- makes that upsert well-defined. Additive only -- safe to re-run.
+CREATE TABLE IF NOT EXISTS task_resource_requests (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id                  TEXT NOT NULL REFERENCES tasks(id),
+    resource_kind            TEXT NOT NULL DEFAULT 'gpu',
+    schema_version           INTEGER NOT NULL DEFAULT 1,
+    selector_type            TEXT NOT NULL,
+    selector_value           TEXT NOT NULL,
+    exclusive                INTEGER NOT NULL DEFAULT 1,
+    min_free_mib             INTEGER NOT NULL DEFAULT 0,
+    headroom_mib             INTEGER NOT NULL DEFAULT 0,
+    reservation_ttl_seconds  INTEGER NOT NULL,
+    request_json             TEXT NOT NULL,
+    request_sha256           TEXT NOT NULL,
+    created_at               INTEGER NOT NULL,
+    UNIQUE (card_id, resource_kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
