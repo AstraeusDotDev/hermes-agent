@@ -413,12 +413,20 @@ def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
     return {n: getattr(obj, n) if obj is not None else None for n in names}
 
 
-def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+def _task_summary_dict(kb, conn, task, intents=None) -> dict[str, Any]:
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
-    return {
+    out = {
         **_fields(task, _TASK_SUMMARY_FIELDS), "parents": parents, "children": children,
         "parent_count": len(parents), "child_count": len(children)}
+    # Resource intent is ADDITIVE: present only for Cards that declared one.
+    # An ordinary CPU Card's summary must stay byte-identical to its
+    # pre-resource shape, so the key is omitted rather than set to null.
+    if intents is not None:
+        intent = intents.get(task.id)
+        if intent is not None:
+            out["resource_intent"] = intent.to_dict()
+    return out
 
 
 # --- Goal-mode judge gate ---
@@ -640,8 +648,13 @@ def _handle_show(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        shown = _fields(task, _TASK_FIELDS)
+        # Additive only: a CPU Card's show payload gains no key at all.
+        intent = kb.get_resource_intent(conn, tid)
+        if intent is not None:
+            shown["resource_intent"] = intent.to_dict()
         return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
+            "task": shown,
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
@@ -678,8 +691,10 @@ def _handle_list(args: dict, **kw) -> str:
             tenant=args.get("tenant"), include_archived=include_archived, limit=limit + 1)
         truncated = len(rows) > limit
         tasks = rows[:limit]
+        # One query for the whole page rather than N per-Card lookups.
+        intents = kb.list_resource_intents(conn, [t.id for t in tasks])
         return json.dumps({
-            "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+            "tasks": [_task_summary_dict(kb, conn, t, intents) for t in tasks],
             "count": len(tasks), "limit": limit, "truncated": truncated,
             "next_limit": (min(limit * 2, KANBAN_LIST_MAX_LIMIT)
                            if truncated and limit < KANBAN_LIST_MAX_LIMIT else None),
