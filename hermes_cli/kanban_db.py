@@ -28,7 +28,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from toolsets import get_toolset_names
 
@@ -1614,6 +1614,115 @@ def create_task_with_resource(
             ),
         )
     return task_id
+
+
+@dataclass(frozen=True)
+class ResourceIntent:
+    """Canonical resource intent for one Card, as read back from storage.
+
+    Immutable and typed. ``selector_type``/``selector_value`` name the resource
+    (e.g. ``exact`` + a device id); the ``*_mib`` fields are admission floors,
+    not observations. ``request_sha256`` is the digest of the canonical
+    ``request_json`` recorded at creation, carried through so a reader can
+    re-verify that what it is about to act on is what was actually requested.
+    """
+
+    card_id: str
+    resource_kind: str
+    schema_version: int
+    selector_type: str
+    selector_value: str
+    exclusive: bool
+    min_free_mib: int
+    headroom_mib: int
+    reservation_ttl_seconds: int
+    request_sha256: str
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ResourceIntent":
+        return cls(
+            card_id=row["card_id"],
+            resource_kind=row["resource_kind"],
+            schema_version=int(row["schema_version"]),
+            selector_type=row["selector_type"],
+            selector_value=row["selector_value"],
+            exclusive=bool(row["exclusive"]),
+            min_free_mib=int(row["min_free_mib"]),
+            headroom_mib=int(row["headroom_mib"]),
+            reservation_ttl_seconds=int(row["reservation_ttl_seconds"]),
+            request_sha256=row["request_sha256"],
+            created_at=int(row["created_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Plain-typed mapping for JSON output (bool stays bool, not 0/1)."""
+        return {
+            "card_id": self.card_id,
+            "resource_kind": self.resource_kind,
+            "schema_version": self.schema_version,
+            "selector_type": self.selector_type,
+            "selector_value": self.selector_value,
+            "exclusive": self.exclusive,
+            "min_free_mib": self.min_free_mib,
+            "headroom_mib": self.headroom_mib,
+            "reservation_ttl_seconds": self.reservation_ttl_seconds,
+            "request_sha256": self.request_sha256,
+            "created_at": self.created_at,
+        }
+
+
+def get_resource_intent(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[ResourceIntent]:
+    """Read one Card's resource intent, or None if it declared none.
+
+    None is the ONLY signal for "no intent": the relation is optional by
+    design, and an ordinary CPU Card has no row here. Callers must omit the
+    field entirely in that case rather than emitting a null placeholder, so
+    CPU Card output stays byte-identical to its pre-resource shape.
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT card_id, resource_kind, schema_version, selector_type, selector_value,
+                   exclusive, min_free_mib, headroom_mib, reservation_ttl_seconds,
+                   request_sha256, created_at
+            FROM task_resource_requests WHERE card_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Pre-migration DB that has not yet had the table added. Intent is
+        # absent, not an error: a reader must not fail on an older board.
+        return None
+    return ResourceIntent.from_row(row) if row is not None else None
+
+
+def list_resource_intents(
+    conn: sqlite3.Connection, task_ids: Sequence[str]
+) -> dict[str, ResourceIntent]:
+    """Batch variant of :func:`get_resource_intent` for list surfaces.
+
+    One query for the whole page instead of N. Ids with no intent are simply
+    absent from the returned mapping.
+    """
+    ids = [t for t in task_ids if t]
+    if not ids:
+        return {}
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT card_id, resource_kind, schema_version, selector_type, selector_value,
+                   exclusive, min_free_mib, headroom_mib, reservation_ttl_seconds,
+                   request_sha256, created_at
+            FROM task_resource_requests WHERE card_id IN ({','.join('?' * len(ids))})
+            """,
+            ids,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {row["card_id"]: ResourceIntent.from_row(row) for row in rows}
 
 
 def _board_meta_for(board: Optional[str]) -> dict:
