@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -24,7 +25,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from toolsets import get_toolset_names
 
@@ -1450,6 +1451,97 @@ def create_task(
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
+
+
+def canonical_resource_request(request: Mapping[str, Any]) -> tuple[str, str]:
+    """Return ``(canonical_json, sha256_hex)`` for a resource request.
+
+    Canonical form is ``json.dumps(..., sort_keys=True, separators=(',', ':'))``:
+    sorted keys, no insignificant whitespace. Two logically identical requests
+    therefore hash identically regardless of the caller's key order or spacing,
+    which is what makes ``request_sha256`` usable as an idempotency/dedup key.
+
+    Hashing the CANONICAL text (not a re-serialisation of the parsed object) means
+    the stored digest always corresponds byte-for-byte to the stored
+    ``request_json``.
+    """
+    payload = json.dumps(request, sort_keys=True, separators=(",", ":"))
+    return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def create_task_with_resource(
+    conn: sqlite3.Connection,
+    *,
+    resource_request: Optional[Mapping[str, Any]] = None,
+    **task_kwargs: Any,
+) -> str:
+    """Create a Card and, when ``resource_request`` is given, its resource row.
+
+    The Card and its ``task_resource_requests`` row are written inside ONE
+    transaction, so a failure anywhere leaves neither behind: a Card that
+    demanded a GPU reservation must never exist without the reservation that a
+    dispatcher would rely on to admit it, and a reservation must never exist for
+    a Card the dispatcher cannot see.
+
+    ``resource_request`` keys map to the table columns:
+
+        selector_type, selector_value, resource_kind (default ``gpu``),
+        schema_version (default 1), exclusive (default 1), min_free_mib,
+        headroom_mib, reservation_ttl_seconds
+
+    ``request_json``/``request_sha256`` are computed from the whole
+    ``resource_request`` mapping, so the recorded intent is exactly what the
+    caller supplied — including any keys beyond the columns.
+
+    Resource intent is NEVER inferred: with no ``resource_request`` this is
+    exactly ``create_task`` and writes no resource row. Nothing backfills.
+    """
+    if resource_request is None:
+        return create_task(conn, **task_kwargs)
+
+    request = dict(resource_request)
+    missing = [k for k in ("selector_type", "selector_value", "reservation_ttl_seconds")
+               if k not in request]
+    if missing:
+        raise ValueError(f"resource_request missing required keys: {sorted(missing)}")
+    ttl = request["reservation_ttl_seconds"]
+    if type(ttl) is not int or ttl <= 0:
+        raise ValueError("reservation_ttl_seconds must be a positive int")
+
+    canonical, digest = canonical_resource_request(request)
+    now = int(time.time())
+
+    # allow_nested: create_task is a composition primitive (it already opts in),
+    # so composing it here must too. Without it write_txn raises rather than
+    # silently committing the Card before the resource row is attempted.
+    from hermes_cli.kanban_db_connect import write_txn
+
+    with write_txn(conn, allow_nested=True):
+        task_id = create_task(conn, **task_kwargs)
+        conn.execute(
+            """
+            INSERT INTO task_resource_requests
+                (card_id, resource_kind, schema_version, selector_type, selector_value,
+                 exclusive, min_free_mib, headroom_mib, reservation_ttl_seconds,
+                 request_json, request_sha256, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                str(request.get("resource_kind", "gpu")),
+                int(request.get("schema_version", 1)),
+                request["selector_type"],
+                request["selector_value"],
+                1 if request.get("exclusive", 1) else 0,
+                int(request.get("min_free_mib", 0)),
+                int(request.get("headroom_mib", 0)),
+                ttl,
+                canonical,
+                digest,
+                now,
+            ),
+        )
+    return task_id
 
 
 def _board_meta_for(board: Optional[str]) -> dict:
