@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from toolsets import get_toolset_names
+from hermes_cli.resource_intent import (
+    canonicalize_resource_intent,
+    is_canonical_resource_intent,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -1349,6 +1353,47 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _existing_resource_idempotent_task(
+    conn: sqlite3.Connection,
+    idempotency_key: Optional[str],
+    *,
+    resource_intent: Optional[Mapping[str, Any]],
+    canonical_json: Optional[str],
+    digest: Optional[str],
+) -> Optional[str]:
+    """Return an existing idempotent task, refusing resource-intent divergence."""
+    if not idempotency_key:
+        return None
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    if not row:
+        return None
+    task_id = row["id"]
+    stored = conn.execute(
+        "SELECT request_json, request_sha256 FROM task_resource_requests WHERE card_id = ?",
+        (task_id,),
+    ).fetchone()
+    if resource_intent is None:
+        if stored is not None:
+            raise ValueError(
+                f"idempotency key {idempotency_key!r} already belongs to task {task_id} "
+                "with different resource intent; nothing changed"
+            )
+        return task_id
+    if (stored is None
+            or not is_canonical_resource_intent(resource_intent, stored["request_sha256"])
+            or stored["request_json"] != canonical_json
+            or stored["request_sha256"] != digest):
+        raise ValueError(
+            f"idempotency key {idempotency_key!r} already belongs to task {task_id} "
+            "with different resource intent; nothing changed"
+        )
+    return task_id
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1363,6 +1408,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    resource_intent: Optional[Mapping[str, Any]] = None,
+    _creation_status: Optional[list[bool]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1378,9 +1425,18 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``resource_intent`` is strictly validated and canonically persisted with the
+    Card in the same transaction. Reusing an idempotency key requires an
+    identical canonical resource intent.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    if _creation_status is not None:
+        _creation_status.clear()
+    canonical_resource_json = resource_digest = None
+    if resource_intent is not None:
+        canonical_resource_json, resource_digest = canonicalize_resource_intent(resource_intent)
 
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
@@ -1417,16 +1473,18 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    # Optimistic lookup avoids opening a write transaction for the common retry.
+    existing = _existing_resource_idempotent_task(
+        conn,
+        idempotency_key,
+        resource_intent=resource_intent,
+        canonical_json=canonical_resource_json,
+        digest=resource_digest,
+    )
+    if existing:
+        if _creation_status is not None:
+            _creation_status.append(False)
+        return existing
 
     now = int(time.time())
 
@@ -1444,6 +1502,19 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # Recheck after BEGIN IMMEDIATE: another writer may have created
+                # this idempotency key since the optimistic lookup above.
+                existing = _existing_resource_idempotent_task(
+                    conn,
+                    idempotency_key,
+                    resource_intent=resource_intent,
+                    canonical_json=canonical_resource_json,
+                    digest=resource_digest,
+                )
+                if existing:
+                    if _creation_status is not None:
+                        _creation_status.append(False)
+                    return existing
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1475,6 +1546,32 @@ def create_task(
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
+                if resource_intent is not None:
+                    assert canonical_resource_json is not None and resource_digest is not None
+                    intent = json.loads(canonical_resource_json)
+                    conn.execute(
+                        """
+                        INSERT INTO task_resource_requests
+                            (card_id, resource_kind, schema_version, selector_type, selector_value,
+                             exclusive, min_free_mib, headroom_mib, reservation_ttl_seconds,
+                             request_json, request_sha256, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            intent["resource_kind"],
+                            intent["schema_version"],
+                            intent["selector_type"],
+                            intent["selector_value"],
+                            int(intent["exclusive"]),
+                            intent["min_free_mib"],
+                            intent["headroom_mib"],
+                            intent["reservation_ttl_seconds"],
+                            canonical_resource_json,
+                            resource_digest,
+                            now,
+                        ),
+                    )
                 for pid in parents:
                     _link(conn, pid, task_id)
                 _append_event(
@@ -1518,6 +1615,8 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            if _creation_status is not None:
+                _creation_status.append(True)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

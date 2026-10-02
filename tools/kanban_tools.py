@@ -13,10 +13,11 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, cast
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.resource_intent import canonicalize_resource_intent
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -1110,6 +1111,11 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
     _reject_delegated_child_mutation("kanban_create")
+    resource_intent = args.get("resource_intent")
+    if "resource_intent" in args:
+        # Validate before opening the board connection; connect can initialize
+        # or migrate the database, so malformed intent must not reach it.
+        canonicalize_resource_intent(cast(Mapping[str, Any], resource_intent))
     title = _require_text(args, "title")
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
@@ -1129,6 +1135,8 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
+        idempotency_key = args.get("idempotency_key")
+        creation_status: list[bool] = []
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1155,18 +1163,21 @@ def _handle_create(args: dict, **kw) -> str:
             board=args.get("board"),
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
-            idempotency_key=args.get("idempotency_key"),
+            idempotency_key=idempotency_key,
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
+            resource_intent=resource_intent,
+            _creation_status=creation_status,
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(
+                       conn, new_tid, allow_create=bool(creation_status and creation_status[0])))
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
@@ -1241,11 +1252,13 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         delivery_metadata=delivery_metadata or None)
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
-    """Subscribe the calling session to completion/block events; True iff a row was
-    written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
-    ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
+def _maybe_auto_subscribe(conn: Any, task_id: str, *, allow_create: bool = True) -> bool:
+    """Ensure the calling session is subscribed to completion/block events when enabled.
+
+    Returns True when the target already has a subscription or one was written.
+    An idempotent retry passes ``allow_create=False`` so it can report existing
+    state without adding a new subscriber to an already-created Card.
+    """
     try:
         if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
             return False
@@ -1263,6 +1276,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
             return True
+        if not allow_create:
+            return False
         _kbn.add_notify_sub(conn, task_id=task_id, **target)
         return True
     except Exception as _exc:

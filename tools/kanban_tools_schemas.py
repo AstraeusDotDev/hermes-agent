@@ -507,6 +507,33 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "resource_intent": {
+            "type": "object",
+            "description": (
+                "Optional typed GPU reservation intent. Supply every field exactly as shown; "
+                "unknown or missing fields are rejected."
+            ),
+            "properties": {
+                "resource_kind": {"type": "string", "enum": ["gpu"]},
+                "schema_version": {"type": "integer", "enum": [1]},
+                "selector_type": {"type": "string", "enum": ["auto", "exact"]},
+                "selector_value": {
+                    "type": "string",
+                    "description": "'auto' for selector_type='auto', or a GPU UUID for 'exact'.",
+                },
+                "exclusive": {"type": "boolean"},
+                "min_free_mib": {"type": "integer", "minimum": 0},
+                "headroom_mib": {"type": "integer", "minimum": 0},
+                "reservation_ttl_seconds": {
+                    "type": "integer", "minimum": 1, "maximum": 86400,
+                },
+            },
+            "required": [
+                "resource_kind", "schema_version", "selector_type", "selector_value",
+                "exclusive", "min_free_mib", "headroom_mib", "reservation_ttl_seconds",
+            ],
+            "additionalProperties": False,
+        },
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "
