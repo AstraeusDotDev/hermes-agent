@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db
@@ -45,3 +49,28 @@ def test_connect_raises_for_explicit_db_path_under_real_root():
 
     with pytest.raises(RuntimeError, match="kanban_write_guard"):
         kbc.connect(_conftest._REAL_KANBAN_ROOT / "kanban.db")
+
+
+def test_module_purging_fixtures_do_not_disable_write_guard_in_suite_order():
+    """The two module-purging fixtures must not strand this file on stale imports."""
+    project_root = Path(__file__).resolve().parents[2]
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:randomly",
+        "tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py::test_cli_dispatch_passes_max_in_progress_from_config",
+        "tests/hermes_cli/test_kanban_per_profile_cap.py::test_cap_2_balances_two_profiles",
+        "tests/hermes_cli/test_kanban_write_guard.py::test_connect_raises_when_kanban_home_is_real_root",
+        "tests/hermes_cli/test_kanban_write_guard.py::test_connect_raises_for_explicit_db_path_under_real_root",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -23,10 +23,34 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    # These tests reload Hermes modules under a different HERMES_HOME. Keep
+    # the objects imported during collection in place for later test modules:
+    # their module-level imports keep references to those exact identities.
+    removed_modules = {
+        mod: sys.modules[mod]
+        for mod in list(sys.modules)
+        if mod.startswith("hermes_cli")
+        or mod.startswith("hermes_state")
+        or mod == "hermes_constants"
+    }
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+        if (
+            mod.startswith("hermes_cli")
+            or mod.startswith("hermes_state")
+            or mod == "hermes_constants"
+        ):
             del sys.modules[mod]
-    yield test_home
+    try:
+        yield test_home
+    finally:
+        for mod in list(sys.modules):
+            if (
+                mod.startswith("hermes_cli")
+                or mod.startswith("hermes_state")
+                or mod == "hermes_constants"
+            ):
+                del sys.modules[mod]
+        sys.modules.update(removed_modules)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

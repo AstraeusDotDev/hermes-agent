@@ -181,6 +181,83 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _scratch_workspace_has_unpublished_git_work(workspace: Path) -> bool:
+    """Fail-safe check for dirty or unpushed Git work anywhere under scratch.
+
+    Workers sometimes create a linked Git worktree inside a scratch workspace.
+    Deleting the outer directory would silently destroy that checkout, including
+    uncommitted source changes. Preserve scratch if nested Git state cannot be
+    proven clean and reachable from a remote-tracking ref or local trunk.
+    """
+    git_roots: list[Path] = []
+    walk_errors: list[OSError] = []
+
+    def _record_walk_error(error: OSError) -> None:
+        walk_errors.append(error)
+
+    try:
+        for root, dirs, files in os.walk(
+            workspace, topdown=True, onerror=_record_walk_error, followlinks=False
+        ):
+            if ".git" in dirs or ".git" in files:
+                git_roots.append(Path(root))
+                # Git's object store can be much larger than the checkout and
+                # cannot contain another working tree we need to inspect.
+                if ".git" in dirs:
+                    dirs.remove(".git")
+    except OSError as exc:
+        walk_errors.append(exc)
+    if walk_errors:
+        _kb._log.warning(
+            "Preserving scratch workspace %s: could not inspect all entries for Git work: %s",
+            workspace,
+            walk_errors[0],
+        )
+        return True
+    if not git_roots:
+        return False
+
+    try:
+        from hermes_cli.worktree_ops import (
+            _worktree_has_unpushed_commits,
+            _worktree_is_dirty,
+        )
+    except Exception as exc:
+        _kb._log.warning(
+            "Preserving scratch workspace %s: Git safety checks unavailable: %s",
+            workspace,
+            exc,
+        )
+        return True
+
+    for candidate in git_roots:
+        try:
+            result = _git(candidate, "rev-parse", "--show-toplevel", timeout=10)
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or "git rev-parse failed").strip())
+            repo_root = Path(result.stdout.strip()).resolve(strict=False)
+            if repo_root != candidate.resolve(strict=False):
+                raise RuntimeError(f"unexpected repository root {repo_root}")
+            if _worktree_is_dirty(
+                str(repo_root), str(repo_root)
+            ) or _worktree_has_unpushed_commits(str(repo_root)):
+                _kb._log.warning(
+                    "Preserving scratch workspace %s: nested Git work at %s is dirty or unpushed",
+                    workspace,
+                    repo_root,
+                )
+                return True
+        except Exception as exc:
+            _kb._log.warning(
+                "Preserving scratch workspace %s: could not verify Git work at %s: %s",
+                workspace,
+                candidate,
+                exc,
+            )
+            return True
+    return False
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -222,9 +299,17 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # source tree; without this, completion would rmtree the user's data.
             # See #28818.
             if _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
+                if _scratch_workspace_has_unpublished_git_work(wp):
+                    _kb._log.warning(
+                        "Preserving scratch workspace for task %s because it contains "
+                        "uncommitted or unpushed Git work: %s",
+                        task_id,
+                        wp,
+                    )
+                else:
+                    release_lsp_clients(str(wp))
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -252,7 +337,10 @@ def _cleanup_worktree_workspace(
     it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
-        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+        from hermes_cli.worktree_ops import (
+            _worktree_has_unpushed_commits,
+            _worktree_is_dirty,
+        )
     except Exception:
         return  # CLI safety predicates unavailable — preserve
     try:
@@ -341,9 +429,17 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if _scratch_workspace_has_unpublished_git_work(wp):
+                    _kb._log.warning(
+                        "Preserving deferred scratch workspace for task %s because it contains "
+                        "uncommitted or unpushed Git work: %s",
+                        parent_id,
+                        wp,
+                    )
+                else:
+                    release_lsp_clients(str(wp))
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 

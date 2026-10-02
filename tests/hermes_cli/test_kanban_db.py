@@ -847,6 +847,63 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+@pytest.mark.parametrize("work_state", ["dirty", "unpushed"])
+def test_complete_preserves_scratch_workspace_with_nested_git_work(
+    kanban_home, tmp_path, work_state
+):
+    """Completion must not rmtree a scratch workspace containing source work."""
+    repo = tmp_path / "source-repo"
+    _init_git_repo(repo)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="edit in nested worktree")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, task_id, workspace)
+        checkout = workspace / "hermes-agent"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-b",
+                "worker-output",
+                str(checkout),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        if work_state == "dirty":
+            source_change = checkout / "README.md"
+            source_change.write_text("uncommitted source change\n", encoding="utf-8")
+        else:
+            source_change = checkout / "worker-output.txt"
+            source_change.write_text("committed but not pushed\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(checkout), "add", str(source_change)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(checkout), "commit", "-m", "worker output"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        assert kb.complete_task(conn, task_id, result="finished")
+
+    assert workspace.is_dir(), (
+        "scratch cleanup must preserve uncommitted/unpushed Git work"
+    )
+    assert source_change.read_text(encoding="utf-8")
+
+
 def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     """A review-bound card's declared files must outlive the reviewer's
     completion — that completion is what cleans the scratch workspace up."""
@@ -938,6 +995,62 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
 
     assert not parent_ws.exists(), (
         "A 'dir' child completing must trigger the parent scratch sweep"
+    )
+    assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
+
+
+def test_deferred_scratch_cleanup_preserves_nested_git_work(kanban_home, tmp_path):
+    """The child-completion cleanup route must preserve unpublished parent work too."""
+    repo = tmp_path / "parent-source-repo"
+    _init_git_repo(repo)
+    child_dir = tmp_path / "persistent-child-for-nested-work"
+    child_dir.mkdir()
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="scratch parent with source work")
+        child = kb.create_task(
+            conn,
+            title="persistent child",
+            workspace_kind="dir",
+            workspace_path=str(child_dir),
+        )
+        kb.link_tasks(conn, parent, child)
+        parent_task = kb.get_task(conn, parent)
+        assert parent_task is not None
+        parent_ws = kbw.resolve_workspace(parent_task)
+        kbw.set_workspace_path(conn, parent, parent_ws)
+        checkout = parent_ws / "hermes-agent"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-b",
+                "parent-output",
+                str(checkout),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        source_change = checkout / "README.md"
+        source_change.write_text(
+            "parent's uncommitted source change\n", encoding="utf-8"
+        )
+
+        assert kb.complete_task(conn, parent, result="handoff")
+        assert parent_ws.exists(), (
+            "parent scratch is deferred while the child is active"
+        )
+        assert kb.complete_task(conn, child, result="built")
+
+    assert parent_ws.is_dir(), (
+        "deferred cleanup must not destroy nested dirty Git work"
+    )
+    assert (
+        source_change.read_text(encoding="utf-8")
+        == "parent's uncommitted source change\n"
     )
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
 
