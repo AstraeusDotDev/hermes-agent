@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
@@ -48,6 +50,50 @@ def _intent(**overrides):
         "reservation_ttl_seconds": 600,
         **overrides,
     }
+
+
+def _synchronize_initial_idempotency_lookups(monkeypatch):
+    """Make both writers observe the missing key before either starts writing."""
+    barrier = threading.Barrier(2, timeout=10)
+    lock = threading.Lock()
+    first_connections = set()
+    original = kb._existing_resource_idempotent_task
+
+    def synchronized_lookup(conn, *args, **kwargs):
+        result = original(conn, *args, **kwargs)
+        with lock:
+            first_lookup = id(conn) not in first_connections
+            first_connections.add(id(conn))
+        if first_lookup:
+            barrier.wait()
+        return result
+
+    monkeypatch.setattr(kb, "_existing_resource_idempotent_task", synchronized_lookup)
+
+
+def _race_task_creates(requests):
+    def create_task(title, assignee, request):
+        connection = kbc.connect()
+        try:
+            return kb.create_task(
+                connection,
+                title=title,
+                assignee=assignee,
+                resource_intent=request,
+                idempotency_key="concurrent-resource",
+            )
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(create_task, *request) for request in requests]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result(timeout=20))
+            except ValueError as exc:
+                results.append(exc)
+    return results
 
 
 def _resource_row(conn, task_id):
@@ -165,6 +211,82 @@ def test_existing_card_without_intent_rejects_intent_retry(conn):
     assert (
         conn.execute("SELECT COUNT(*) FROM task_resource_requests").fetchone()[0] == 0
     )
+
+
+def test_concurrent_same_intent_create_returns_one_card(kanban_home, monkeypatch):
+    _synchronize_initial_idempotency_lookups(monkeypatch)
+    request = _intent()
+    results = _race_task_creates([
+        ("first concurrent GPU task", "worker-a", request),
+        ("second concurrent GPU task", "worker-b", _intent()),
+    ])
+
+    assert len(results) == 2
+    assert all(isinstance(task_id, str) for task_id in results), results
+    assert results[0] == results[1]
+    canonical, digest = canonicalize_resource_intent(request)
+    with kbc.connect() as connection:
+        rows = connection.execute(
+            "SELECT t.id, t.title, r.request_json, r.request_sha256 "
+            "FROM tasks AS t JOIN task_resource_requests AS r ON r.card_id = t.id "
+            "WHERE t.idempotency_key = ?",
+            ("concurrent-resource",),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["id"] == results[0]
+        assert rows[0]["title"] in {
+            "first concurrent GPU task",
+            "second concurrent GPU task",
+        }
+        assert rows[0]["request_json"] == canonical
+        assert rows[0]["request_sha256"] == digest
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM task_resource_requests"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_concurrent_divergent_intents_fail_without_mutating_card(
+    kanban_home, monkeypatch
+):
+    _synchronize_initial_idempotency_lookups(monkeypatch)
+    requests = [
+        ("first divergent GPU task", "worker-a", _intent(min_free_mib=1)),
+        ("second divergent GPU task", "worker-b", _intent(min_free_mib=2)),
+    ]
+    results = _race_task_creates(requests)
+
+    successful_ids = [result for result in results if isinstance(result, str)]
+    failures = [result for result in results if isinstance(result, ValueError)]
+    assert len(successful_ids) == 1, results
+    assert len(failures) == 1, results
+    assert "different resource intent" in str(failures[0])
+
+    with kbc.connect() as connection:
+        rows = connection.execute(
+            "SELECT t.id, t.title, t.assignee, r.request_json, r.request_sha256 "
+            "FROM tasks AS t JOIN task_resource_requests AS r ON r.card_id = t.id "
+            "WHERE t.idempotency_key = ?",
+            ("concurrent-resource",),
+        ).fetchall()
+        assert len(rows) == 1
+        task = rows[0]
+        assert task["id"] == successful_ids[0]
+        winner = next(request for request in requests if request[0] == task["title"])
+        canonical, digest = canonicalize_resource_intent(winner[2])
+        assert task["assignee"] == winner[1]
+        assert task["request_json"] == canonical
+        assert task["request_sha256"] == digest
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM task_resource_requests"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_cli_resources_json_writes_and_idempotently_reuses_card(kanban_home, capsys):
