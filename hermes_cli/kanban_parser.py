@@ -9,10 +9,12 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import json
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli.resource_intent import canonicalize_resource_intent
 
 
 def _arg(*flags: str, **kw):
@@ -52,6 +54,31 @@ def _nonnegative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("retention days must be >= 0 (0 disables that sweep)")
     return parsed
+
+
+def _resource_intent_json(value: str) -> dict:
+    """Parse exactly one JSON object and validate it before CLI DB initialization."""
+    def unique_object(pairs):
+        parsed = {}
+        for key, item in pairs:
+            if key in parsed:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            parsed[key] = item
+        return parsed
+
+    def reject_constant(token: str):
+        raise ValueError(f"invalid JSON constant {token}")
+
+    try:
+        request = json.loads(
+            value, object_pairs_hook=unique_object, parse_constant=reject_constant
+        )
+        if not isinstance(request, dict):
+            raise ValueError("must be a JSON object")
+        canonicalize_resource_intent(request)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return request
 
 
 def _run_state_args(type_help: str):
@@ -164,6 +191,8 @@ _SPECS = [
              help="Read the opening post from a file ('-' = stdin), so bodies with embedded "
                   "newlines or flag-like lines survive shell quoting. "
                   "Mutually exclusive with --body."),
+        _arg("--resources-json", dest="resource_intent", type=_resource_intent_json,
+             metavar="JSON", help="GPU resource intent as exactly one validated JSON object."),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--workspace",
