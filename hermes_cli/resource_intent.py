@@ -196,7 +196,7 @@ def canonicalize_resource_intent(request: Mapping[str, Any]) -> tuple[str, str]:
 
     # --- device selection ----------------------------------------------------
     selector_type = request["selector_type"]
-    if selector_type not in _SELECTOR_TYPES:
+    if not isinstance(selector_type, str) or selector_type not in _SELECTOR_TYPES:
         raise ResourceIntentError(
             "bad_selector_type",
             f"selector_type must be one of {sorted(_SELECTOR_TYPES)}, "

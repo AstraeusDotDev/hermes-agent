@@ -1,9 +1,10 @@
 """Pure validation for GPU reservation grant receipts.
 
-A resource intent describes a request; a receipt attests that a grant was made.
-This module validates the latter and binds its request digest to an admitted
-intent supplied separately by the caller. It performs no I/O and never reads
-the clock.
+A resource intent describes a request; a receipt describes a purported grant.
+This module validates receipt structure and binds its request digest to an
+admitted intent supplied separately by the caller. It does not authenticate
+signatures, fencing ownership, or selector/request consistency. It performs
+no I/O and never reads the clock.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from hermes_cli.resource_intent import (
@@ -34,6 +35,7 @@ RESOURCE_RECEIPT_KEYS = frozenset(
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _GPU_UUID_RE = re.compile(r"^GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -67,15 +69,15 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _parse_expiry(value: Any) -> datetime | int | None:
-    """Parse supported expiry forms without consulting a clock."""
+    """Parse integer epochs or UTC-normalizable ISO values without a clock."""
     if type(value) is int:
         return value
     if not isinstance(value, str) or not value or value != value.strip():
         return None
     iso_value = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
     try:
-        return datetime.fromisoformat(iso_value)
-    except ValueError:
+        return _as_utc(datetime.fromisoformat(iso_value))
+    except (ValueError, OverflowError):
         return None
 
 
@@ -85,7 +87,7 @@ def validate_resource_receipt(
     now: datetime | None = None,
     admitted_request: Mapping[str, Any] | None = None,
 ) -> ReceiptValidationResult:
-    """Validate a receipt and bind its digest to an admitted resource intent.
+    """Validate receipt structure and bind its digest to an admitted intent.
 
     ``now`` is supplied by the caller. If omitted, the expiry cannot be proven
     future-dated and validation fails closed. ``admitted_request`` must be the
@@ -153,16 +155,27 @@ def validate_resource_receipt(
                 reasons.append("expiry:empty")
             else:
                 reasons.append("expiry:wrong_type_or_format")
-        elif now is None:
+
+        current = None
+        if now is None:
             reasons.append("expiry:now_required")
         elif not isinstance(now, datetime):
             reasons.append("expiry:invalid_now")
         else:
-            current = _as_utc(now)
+            try:
+                current = _as_utc(now)
+            except (ValueError, OverflowError):
+                reasons.append("expiry:invalid_now")
+
+        if parsed_expiry is not None and current is not None:
             if isinstance(parsed_expiry, int):
-                is_future = parsed_expiry > current.timestamp()
+                # Float timestamps round away microseconds near datetime's limits.
+                # Keep arbitrary-size integer epochs valid without converting them
+                # to a bounded datetime.
+                current_us = (current - _UNIX_EPOCH) // timedelta(microseconds=1)
+                is_future = parsed_expiry * 1_000_000 > current_us
             else:
-                is_future = _as_utc(parsed_expiry) > current
+                is_future = parsed_expiry > current
             if not is_future:
                 reasons.append("expiry:not_in_future")
 

@@ -171,6 +171,45 @@ def test_expiry_equal_to_now_is_rejected_for_epoch_and_iso() -> None:
         assert "expiry:not_in_future" in result.reasons
 
 
+@pytest.mark.parametrize(
+    "expiry",
+    [
+        datetime(1, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+        datetime(1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+        NOW,
+        datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+    ],
+)
+@pytest.mark.parametrize("offset_us", [-1, 0, 1])
+def test_epoch_and_iso_expiry_agree_at_microsecond_boundary(expiry, offset_us) -> None:
+    epoch = (expiry - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(seconds=1)
+    current = expiry + timedelta(microseconds=offset_us)
+    expected = ReceiptValidationResult(
+        offset_us < 0, () if offset_us < 0 else ("expiry:not_in_future",)
+    )
+    for value in (epoch, expiry.isoformat()):
+        assert _validate(_receipt(expiry=value), now=current) == expected
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["0001-01-01T00:00:00+00:01", "9999-12-31T23:59:59-00:01"],
+)
+@pytest.mark.parametrize("invalid_fields", ["expiry", "now", "both"])
+def test_utc_range_errors_preserve_independent_failures(boundary, invalid_fields) -> None:
+    receipt = _receipt(fencing_token="", canonical_receipt=[], request_digest="0" * 64)
+    current = NOW
+    expected = ["fencing_token:empty"]
+    if invalid_fields in ("expiry", "both"):
+        receipt["expiry"] = boundary
+        expected.append("expiry:wrong_type_or_format")
+    if invalid_fields in ("now", "both"):
+        current = datetime.fromisoformat(boundary)
+        expected.append("expiry:invalid_now")
+    expected.extend(["canonical_receipt:wrong_type", "request_digest:mismatch"])
+    assert _validate(receipt, now=current) == ReceiptValidationResult(False, tuple(expected))
+
+
 def test_expiry_requires_caller_supplied_now() -> None:
     _, digest = canonicalize_resource_intent(_intent())
     receipt = _receipt()
@@ -207,6 +246,22 @@ def test_invalid_admitted_request_fails_closed() -> None:
     assert any(
         reason.startswith("request_digest:admitted_request_invalid:")
         for reason in result.reasons
+    )
+
+
+@pytest.mark.parametrize("selector_type", [[], ["auto"], {}, {"type": "exact"}])
+def test_admitted_selector_containers_return_reasons(selector_type) -> None:
+    result = _validate(
+        _receipt(fencing_token="", canonical_receipt=[]),
+        admitted_request=_intent(selector_type=selector_type),
+    )
+    assert result == ReceiptValidationResult(
+        False,
+        (
+            "fencing_token:empty",
+            "canonical_receipt:wrong_type",
+            "request_digest:admitted_request_invalid:bad_selector_type",
+        ),
     )
 
 

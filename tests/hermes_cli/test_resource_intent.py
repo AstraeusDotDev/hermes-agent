@@ -183,6 +183,19 @@ class TestSelector:
             canonicalize_resource_intent(_intent(selector_type="any"))
         assert exc.value.code == "bad_selector_type"
 
+    @pytest.mark.parametrize("selector_type", [[], ["auto"], {}, {"type": "exact"}])
+    @pytest.mark.parametrize("predicate", [False, True])
+    def test_selector_containers_fail_structurally(self, selector_type, predicate) -> None:
+        request = _intent(selector_type=selector_type)
+        if predicate:
+            _, digest = canonicalize_resource_intent(_intent())
+            assert is_canonical_resource_intent(request, digest) is False
+        else:
+            with pytest.raises(ResourceIntentError) as exc:
+                canonicalize_resource_intent(request)
+            assert exc.value.code == "bad_selector_type"
+            assert exc.value.key == "selector_type"
+
     @pytest.mark.parametrize(
         "value",
         [
