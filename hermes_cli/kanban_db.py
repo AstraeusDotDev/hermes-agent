@@ -1092,6 +1092,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_create_time  REAL,
+    worker_exe_path     TEXT,
     -- Spawn-time start fingerprint of worker_pid (see tasks.worker_started_at). Retained with
     -- worker_pid after the run ends so a worker that outlives its terminal transition can
     -- still be found and reaped; NULL = legacy row, never signalled.
@@ -2615,6 +2617,62 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+def _check_retirement_fence(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return ``wait`` while the last recorded worker can still be the same process.
+
+    ``None`` means there is no recorded worker; ``released`` means the process is
+    gone or its recorded identity differs. Unknown process state is conservative:
+    it waits rather than allowing a second worker beside an unverified survivor.
+    """
+    row = conn.execute(
+        "SELECT worker_pid, worker_create_time, worker_exe_path, ended_at "
+        "FROM task_runs WHERE task_id = ? AND worker_pid IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["ended_at"] is None:
+        return "wait"
+
+    try:
+        import psutil
+    except Exception:
+        return "wait"
+    try:
+        proc = psutil.Process(int(row["worker_pid"]))
+    except Exception as exc:
+        no_such_process = getattr(psutil, "NoSuchProcess", ())
+        if no_such_process and isinstance(exc, no_such_process):
+            return "released"
+        return "wait"
+
+    recorded_create_time = row["worker_create_time"]
+    if recorded_create_time is not None:
+        try:
+            live_create_time = float(proc.create_time())
+        except Exception:
+            return "wait"
+        # Match process_identity's two-second tolerance for psutil timestamps.
+        if abs(live_create_time - float(recorded_create_time)) >= 2.0:
+            return "released"
+
+    recorded_exe_path = row["worker_exe_path"]
+    if recorded_exe_path:
+        try:
+            live_exe_path = proc.exe()
+        except Exception:
+            return "wait"
+        if live_exe_path != recorded_exe_path:
+            return "released"
+
+    # Without a creation timestamp, executable path alone cannot prove this is
+    # the same process incarnation (PID reuse can preserve the executable).
+    if recorded_create_time is None:
+        return "wait"
+    return "wait"
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None,
@@ -2685,6 +2743,9 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        if _check_retirement_fence(conn, task_id) == "wait":
+            _append_event(conn, task_id, "retirement_wait", {"reason": "prior_worker_alive"})
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2718,6 +2779,9 @@ def claim_review_task(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
+            return None
+        if _check_retirement_fence(conn, task_id) == "wait":
+            _append_event(conn, task_id, "retirement_wait", {"reason": "prior_worker_alive"})
             return None
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},

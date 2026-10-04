@@ -1472,13 +1472,32 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
     whose bare-PID kill authority a new spawn must not inherit."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    create_time = None
+    exe_path = None
+    try:
+        import psutil
+        proc = psutil.Process(int(pid))
+    except Exception:
+        proc = None
+    if proc is not None:
+        try:
+            create_time = float(proc.create_time())
+        except Exception:
+            pass
+        try:
+            exe_path = proc.exe()
+        except Exception:
+            pass
     with _kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                      (int(pid), started_at, task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, "
+                "worker_create_time = ?, worker_exe_path = ? WHERE id = ?",
+                (int(pid), started_at, create_time, exe_path, run_id),
+            )
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
 
 
