@@ -147,6 +147,8 @@ class DispatchResult:
     a failure — a long quota window must never trip the circuit breaker."""
     deferred_resources: list[dict[str, str]] = field(default_factory=list)
     """Structured resource-admission deferrals; each item names a task and reason."""
+    resource_reservations: list[dict[str, Any]] = field(default_factory=list)
+    """Safe reservation summaries for resource-backed dispatches; never includes fencing tokens."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -173,6 +175,10 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        for item in res.deferred_resources:
+            reason = item.get("reason", "unknown")
+            key = f"resource_{reason}"
+            counts[key] = counts.get(key, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
@@ -2044,6 +2050,110 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+_RESOURCE_EVENT_KINDS = (
+    "resource_wait_started", "resource_reason_changed", "resource_reserved", "guardian_handoff",
+)
+
+
+def _record_resource_wait(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """Coalesce repeated resource waits while recording changes in their cause."""
+    import json
+
+    with _kb.write_txn(conn):
+        previous = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN (?, ?, ?, ?) "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, *_RESOURCE_EVENT_KINDS),
+        ).fetchone()
+        previous_payload: dict[str, Any] = {}
+        if previous is not None and previous["payload"]:
+            try:
+                decoded = json.loads(previous["payload"])
+                if isinstance(decoded, dict):
+                    previous_payload = decoded
+            except (TypeError, ValueError):
+                previous_payload = {}
+        if previous is not None and previous["kind"] in {
+            "resource_wait_started", "resource_reason_changed",
+        }:
+            old_reason = previous_payload.get("reason")
+            if old_reason == reason:
+                return
+            _kb._append_event(
+                conn, task_id, "resource_reason_changed",
+                {"previous_reason": old_reason, "reason": reason},
+            )
+            return
+        _kb._append_event(conn, task_id, "resource_wait_started", {"reason": reason})
+
+
+def _record_resource_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Append a resource lifecycle event unless the same state is already current."""
+    import json
+
+    with _kb.write_txn(conn):
+        previous = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN (?, ?, ?, ?) "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, *_RESOURCE_EVENT_KINDS),
+        ).fetchone()
+        if previous is not None and previous["kind"] == kind:
+            try:
+                previous_payload = json.loads(previous["payload"] or "null")
+            except (TypeError, ValueError):
+                previous_payload = None
+            if kind == "resource_reserved" and isinstance(previous_payload, dict):
+                if previous_payload.get("lease_id") == payload.get("lease_id"):
+                    return
+            if kind == "guardian_handoff" and isinstance(previous_payload, dict):
+                if previous_payload.get("run_id") == payload.get("run_id"):
+                    return
+        _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
+def _resource_reservation_summary(task_id: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose useful reservation identity without returning its fencing token."""
+    return {
+        "task_id": task_id,
+        "lease_id": receipt.get("lease_id"),
+        "request_digest": receipt.get("request_digest"),
+        "gpu_selector": receipt.get("gpu_selector"),
+        "expiry": receipt.get("expiry"),
+        "status": "reserved",
+    }
+
+
+def _cancel_reserved_gpu(reservation: Mapping[str, Any], summary: dict[str, Any]) -> None:
+    """Make one fenced compensation attempt before guardian launch."""
+    from hermes_cli.kanban_guardian_launch import cancel_reservation
+
+    try:
+        cancelled = cancel_reservation(reservation)
+    except Exception:
+        cancelled = False
+    summary["status"] = "cancelled" if cancelled else "cancel_uncertain"
+    if not cancelled:
+        _kb._log.warning(
+            "kanban dispatcher: reservation cancellation uncertain for task %s; "
+            "governor lease remains fail-closed until expiry",
+            summary.get("task_id"),
+        )
+
+
+def _defer_resource(result: DispatchResult, conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    result.deferred_resources.append(
+        {"task_id": task_id, "status": "deferred_resources", "reason": reason}
+    )
+    _record_resource_wait(conn, task_id, reason)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2059,7 +2169,7 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
     gpu_resource_intent: Any = None,
-    gpu_admission: Optional[Callable[[str, str, Any], Optional[str]]] = None,
+    gpu_admission: Optional[Callable[[str, str, Any, str], tuple[Optional[str], Optional[dict[str, Any]]]]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2119,16 +2229,22 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
+    reservation: Optional[dict[str, Any]] = None
+    reservation_summary: Optional[dict[str, Any]] = None
     if gpu_admission is not None:
-        defer_reason = gpu_admission(task_id, assignee, gpu_resource_intent)
+        defer_reason, reservation = gpu_admission(task_id, assignee, gpu_resource_intent, lane)
         if defer_reason is not None:
-            result.deferred_resources.append(
-                {"task_id": task_id, "status": "deferred_resources", "reason": defer_reason}
-            )
+            _defer_resource(result, conn, task_id, defer_reason)
             return False
+        if reservation is not None:
+            reservation_summary = _resource_reservation_summary(task_id, reservation)
+            result.resource_reservations.append(reservation_summary)
+            _record_resource_event(conn, task_id, "resource_reserved", reservation_summary)
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        if reservation is not None and reservation_summary is not None:
+            _cancel_reserved_gpu(reservation, reservation_summary)
         return False
     try:
         resolved_branch_name = None
@@ -2136,25 +2252,54 @@ def _dispatch_lane_task(
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
+        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+        if claimed.workspace_kind == "worktree":
+            _kbw.set_branch_name(
+                conn, claimed.id,
+                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+            )
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     except Exception as exc:
+        if reservation is not None and reservation_summary is not None:
+            _cancel_reserved_gpu(reservation, reservation_summary)
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
         ):
             result.auto_blocked.append(claimed.id)
         return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    guardian_started = False
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        guardian_handoff = spawn_fn is None and reservation is not None
+        if guardian_handoff:
+            pid = _default_spawn(
+                claimed, str(workspace), board=board, resource_reservation=reservation,
+            )
+        else:
+            pid = _call_spawn_fn(
+                spawn_fn if spawn_fn is not None else _default_spawn,
+                claimed, str(workspace), board,
+            )
+        guardian_started = bool(guardian_handoff and pid)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
+            if guardian_handoff and reservation_summary is not None:
+                reservation_summary["guardian_pid"] = int(pid)
+                reservation_summary["status"] = "guardian_handoff"
+                _record_resource_event(
+                    conn, claimed.id, "guardian_handoff",
+                    {
+                        "lease_id": reservation_summary["lease_id"],
+                        "gpu_selector": reservation_summary["gpu_selector"],
+                        "pid": int(pid),
+                        "run_id": claimed.current_run_id,
+                    },
+                    run_id=claimed.current_run_id,
+                )
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2164,6 +2309,13 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        if (
+            reservation is not None
+            and reservation_summary is not None
+            and spawn_fn is None
+            and not guardian_started
+        ):
+            _cancel_reserved_gpu(reservation, reservation_summary)
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the
@@ -2307,7 +2459,7 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
 
 
 def _ready_gpu_resource_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Persisted GPU requests in ready priority/FIFO order."""
+    """Persisted GPU requests in dispatchable priority/FIFO order."""
     try:
         return conn.execute(
             """
@@ -2316,7 +2468,7 @@ def _ready_gpu_resource_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                    r.reservation_ttl_seconds, r.request_sha256, r.created_at
               FROM task_resource_requests AS r
               JOIN tasks AS t ON t.id = r.card_id
-             WHERE t.status = 'ready' AND t.claim_lock IS NULL
+             WHERE t.status IN ('ready', 'review') AND t.claim_lock IS NULL
                AND r.resource_kind = 'gpu'
              ORDER BY t.priority DESC, t.created_at ASC, t.id ASC
             """
@@ -2330,12 +2482,15 @@ def _ready_gpu_resource_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def _ready_gpu_candidates(
-    conn: sqlite3.Connection, ready_rows: list[sqlite3.Row],
+    conn: sqlite3.Connection,
+    ready_rows: list[sqlite3.Row],
+    *,
+    resource_rows: Optional[list[sqlite3.Row]] = None,
 ) -> dict[str, Any]:
     """Snapshot GPU intents for this tick in priority/FIFO order."""
     ready_ids = {row["id"] for row in ready_rows}
     intents: dict[str, Any] = {}
-    for row in _ready_gpu_resource_rows(conn):
+    for row in resource_rows if resource_rows is not None else _ready_gpu_resource_rows(conn):
         task_id = row["card_id"]
         if task_id not in ready_ids:
             continue
@@ -2350,7 +2505,7 @@ def _ready_gpu_candidates(
 def _oldest_current_gpu_candidate(
     conn: sqlite3.Connection, expected_intents: Mapping[str, Any],
 ) -> Optional[str]:
-    """First still-ready GPU row whose intent matches this tick's snapshot."""
+    """First still-dispatchable GPU row matching this tick's snapshot."""
     for row in _ready_gpu_resource_rows(conn):
         task_id = row["card_id"]
         expected = expected_intents.get(task_id)
@@ -2365,14 +2520,17 @@ def _oldest_current_gpu_candidate(
     return None
 
 
-def _gpu_resource_matches_ready_card(
+def _gpu_resource_matches_dispatchable_card(
     conn: sqlite3.Connection, task_id: str, expected_intent: Any,
+    *, lane: str,
 ) -> tuple[Optional[Any], bool]:
-    """Re-read the card and request immediately before starting a reservation."""
+    """Re-read a ready/review card and request immediately before reservation."""
+    expected_status = "review" if lane == "review" else "ready"
     try:
         task = _kb.get_task(conn, task_id)
         row = conn.execute(
-            "SELECT claim_lock FROM tasks WHERE id = ? AND status = 'ready'", (task_id,)
+            "SELECT claim_lock FROM tasks WHERE id = ? AND status = ?",
+            (task_id, expected_status),
         ).fetchone()
         current_intent = _kb.get_resource_intent(conn, task_id)
     except Exception:
@@ -2395,12 +2553,15 @@ def _reserve_gpu_resource(
     assignee: str,
     resource_intent: Any,
     *,
+    lane: str,
     on_attempt: Callable[[], None],
-) -> Optional[str]:
-    """Return a deferral reason, or ``None`` after a verified GPU grant."""
-    task, still_valid = _gpu_resource_matches_ready_card(conn, task_id, resource_intent)
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Return a deferral reason, or the validated receipt after a GPU grant."""
+    task, still_valid = _gpu_resource_matches_dispatchable_card(
+        conn, task_id, resource_intent, lane=lane,
+    )
     if not still_valid:
-        return "resource_request_changed"
+        return "resource_request_changed", None
     try:
         from datetime import datetime, timezone
 
@@ -2416,10 +2577,10 @@ def _reserve_gpu_resource(
         )
         if not getattr(decision, "granted", False):
             reason = getattr(decision, "reason", None)
-            return reason if isinstance(reason, str) and reason else "governor_deferred"
+            return reason if isinstance(reason, str) and reason else "governor_deferred", None
         receipt = getattr(decision, "receipt", None)
         if not isinstance(receipt, Mapping):
-            return "malformed_reservation_receipt"
+            return "malformed_reservation_receipt", None
         admitted_request = {
             key: getattr(resource_intent, key)
             for key in (
@@ -2433,11 +2594,11 @@ def _reserve_gpu_resource(
             admitted_request=admitted_request,
         )
         if not validation.valid:
-            return "reservation_receipt_validation_failed"
+            return "reservation_receipt_validation_failed", None
     except Exception:
         _kb._log.debug("kanban dispatch: GPU admission failed closed for %s", task_id)
-        return "gpu_admission_error"
-    return None
+        return "gpu_admission_error", None
+    return None, dict(receipt)
 
 
 def _any_spawnable_review(
@@ -2470,6 +2631,32 @@ def _any_spawnable_review(
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
     return False
+
+
+def _spawnable_gpu_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    lane: str,
+    default_assignee: Optional[str],
+    per_profile_cap: Optional[int],
+    per_profile_running: Mapping[str, int],
+) -> list[sqlite3.Row]:
+    """Exclude GPU rows that the normal lane guards would not spawn this tick."""
+    profile_exists = _profile_exists_fn()
+    candidates = []
+    for row in rows:
+        assignee = row["assignee"] or (default_assignee if lane == "ready" else None)
+        if not assignee:
+            continue
+        if profile_exists is not None and not profile_exists(assignee):
+            continue
+        if per_profile_cap is not None and per_profile_running.get(assignee, 0) >= per_profile_cap:
+            continue
+        if check_respawn_guard(conn, row["id"], lane=lane) is not None:
+            continue
+        candidates.append(row)
+    return candidates
 
 
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
@@ -2523,23 +2710,12 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    gpu_intents = _ready_gpu_candidates(conn, ready_rows)
-    gpu_attempted = False
-
-    def _admit_gpu(task_id: str, assignee: str, resource_intent: Any) -> Optional[str]:
-        nonlocal gpu_attempted
-
-        def _mark_attempted() -> None:
-            nonlocal gpu_attempted
-            gpu_attempted = True
-
-        return _reserve_gpu_resource(
-            conn, task_id, assignee, resource_intent, on_attempt=_mark_attempted,
-        )
-
+    default_assignee = _resolve_default_assignee(default_assignee)
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    gpu_resource_rows = _ready_gpu_resource_rows(conn)
+    gpu_task_ids = {row["card_id"] for row in gpu_resource_rows}
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
@@ -2570,49 +2746,102 @@ def _dispatch_once_locked(
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     ):
         ready_budget = max(spawn_budget - 1, 0)
+    candidate_rows = []
+    if ready_budget is None or ready_budget > 0:
+        candidate_rows.extend(
+            _spawnable_gpu_rows(
+                conn, [row for row in ready_rows if row["id"] in gpu_task_ids],
+                lane="ready", default_assignee=default_assignee,
+                per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+            )
+        )
+    if spawn_budget is None or spawn_budget > 0:
+        candidate_rows.extend(
+            _spawnable_gpu_rows(
+                conn, [row for row in review_rows if row["id"] in gpu_task_ids],
+                lane="review", default_assignee=None,
+                per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+            )
+        )
+    gpu_intents = _ready_gpu_candidates(conn, candidate_rows, resource_rows=gpu_resource_rows)
+    gpu_attempted = False
+
+    def _admit_gpu(
+        task_id: str, assignee: str, resource_intent: Any, lane: str,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        nonlocal gpu_attempted
+
+        def _mark_attempted() -> None:
+            nonlocal gpu_attempted
+            gpu_attempted = True
+
+        return _reserve_gpu_resource(
+            conn, task_id, assignee, resource_intent, lane=lane, on_attempt=_mark_attempted,
+        )
+
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
-    default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
+
+    def _current_gpu_intents() -> dict[str, Any]:
+        rows = []
+        if ready_budget is None or spawned < ready_budget:
+            rows.extend(
+                _spawnable_gpu_rows(
+                    conn, [row for row in ready_rows if row["id"] in gpu_intents],
+                    lane="ready", default_assignee=default_assignee,
+                    per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+                )
+            )
+        if spawn_budget is None or spawned < spawn_budget:
+            rows.extend(
+                _spawnable_gpu_rows(
+                    conn, [row for row in review_rows if row["id"] in gpu_intents],
+                    lane="review", default_assignee=None,
+                    per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+                )
+            )
+        eligible_ids = {row["id"] for row in rows}
+        return {task_id: intent for task_id, intent in gpu_intents.items() if task_id in eligible_ids}
+
+    def _gpu_lane_kwargs(row: sqlite3.Row, lane: str) -> Optional[dict[str, Any]]:
+        """Fail closed before claim, preserving one global GPU attempt per tick."""
+        task_id = row["id"]
+        if task_id not in gpu_intents or dry_run:
+            return lane_kwargs
+        intent = gpu_intents[task_id]
+        reason = None
+        if intent is None:
+            reason = "invalid_resource_intent"
+        elif not gpu_admission_locked:
+            reason = "dispatch_lock_unavailable"
+        elif gpu_attempted:
+            reason = "reservation_attempt_limit_reached"
+        else:
+            _, unchanged = _gpu_resource_matches_dispatchable_card(
+                conn, task_id, intent, lane=lane,
+            )
+            if not unchanged:
+                reason = "resource_request_changed"
+            else:
+                oldest_gpu_id = _oldest_current_gpu_candidate(conn, _current_gpu_intents())
+                if oldest_gpu_id != task_id:
+                    reason = "older_gpu_card_pending" if oldest_gpu_id else "gpu_request_state_unavailable"
+        if reason is not None:
+            _defer_resource(result, conn, task_id, reason)
+            return None
+        return {
+            **lane_kwargs,
+            "gpu_resource_intent": intent,
+            "gpu_admission": _admit_gpu,
+        }
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
-        gpu_resource_intent = gpu_intents.get(row["id"])
-        is_gpu_card = row["id"] in gpu_intents
-        if is_gpu_card and not dry_run:
-            if gpu_resource_intent is None:
-                result.deferred_resources.append(
-                    {"task_id": row["id"], "status": "deferred_resources", "reason": "invalid_resource_intent"}
-                )
-                continue
-            if not gpu_admission_locked:
-                result.deferred_resources.append(
-                    {"task_id": row["id"], "status": "deferred_resources", "reason": "dispatch_lock_unavailable"}
-                )
-                continue
-            if gpu_attempted:
-                result.deferred_resources.append(
-                    {"task_id": row["id"], "status": "deferred_resources", "reason": "reservation_attempt_limit_reached"}
-                )
-                continue
-            _, intent_unchanged = _gpu_resource_matches_ready_card(
-                conn, row["id"], gpu_resource_intent,
-            )
-            if not intent_unchanged:
-                result.deferred_resources.append(
-                    {"task_id": row["id"], "status": "deferred_resources", "reason": "resource_request_changed"}
-                )
-                continue
-            oldest_gpu_id = _oldest_current_gpu_candidate(conn, gpu_intents)
-            if oldest_gpu_id != row["id"]:
-                reason = "older_gpu_card_pending" if oldest_gpu_id else "gpu_request_state_unavailable"
-                result.deferred_resources.append(
-                    {"task_id": row["id"], "status": "deferred_resources", "reason": reason}
-                )
-                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
@@ -2624,13 +2853,9 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        task_lane_kwargs = lane_kwargs
-        if is_gpu_card and not dry_run:
-            task_lane_kwargs = {
-                **lane_kwargs,
-                "gpu_resource_intent": gpu_resource_intent,
-                "gpu_admission": _admit_gpu,
-            }
+        task_lane_kwargs = _gpu_lane_kwargs(row, "ready")
+        if task_lane_kwargs is None:
+            continue
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **task_lane_kwargs):
             spawned += 1
 
@@ -2644,7 +2869,10 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        task_lane_kwargs = _gpu_lane_kwargs(row, "review")
+        if task_lane_kwargs is None:
+            continue
+        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **task_lane_kwargs):
             spawned += 1
     return result
 
@@ -3048,7 +3276,13 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    resource_reservation: Optional[Mapping[str, Any]] = None,
+) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -3161,15 +3395,30 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
-    log_f = _open_worker_log(task, board)
-    try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+    if resource_reservation is not None:
+        # The guardian wraps the exact normal worker argv and inherits the
+        # worker's cwd, environment, and log descriptors. Move the guardian and
+        # its child together into the restart-safe worker scope.
+        from hermes_cli.kanban_guardian_launch import launch_guardian
+
+        launch = lambda: launch_guardian(  # noqa: E731
+            resource_reservation,
+            cmd,
+            popen=subprocess.Popen,
+            argv_transform=lambda argv: _restart_safe_worker_argv(task, argv),
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+        )
+    else:
+        # CPU/unreserved dispatch keeps the historical argv construction and
+        # process path exactly as before.
+        cmd = _restart_safe_worker_argv(task, cmd)
+        launch = lambda: subprocess.Popen(  # noqa: E731, S603 -- argv is fixed above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
@@ -3179,6 +3428,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
+    from tools.process_registry import systemd_user_bus_env
+    env = systemd_user_bus_env(env)
+    log_f = _open_worker_log(task, board)
+    try:
+        proc = launch()
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
