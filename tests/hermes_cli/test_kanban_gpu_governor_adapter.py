@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,8 +47,10 @@ def _row(**overrides: Any) -> dict[str, Any]:
 def _config(tmp_path: Path, **overrides: Any) -> dict[str, Any]:
     values = {
         "bin": str(ASTRAEUS_GOVERNOR_SCRIPT),
+        "python": str(ASTRAEUS_PYTHON),
         "ledger": str(tmp_path / "governor.sqlite3"),
         "lock_root": str(tmp_path),
+        "admission_window_seconds": 2.0,
     }
     values.update(overrides)
     return {"kanban": {"gpu_governor": values}}
@@ -86,6 +88,25 @@ def _path_digest(path: Path) -> str:
     return hashlib.sha256(str(path.resolve()).encode()).hexdigest()
 
 
+def _install_nvidia_smi_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gpu_uuid: str
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "nvidia-smi"
+    executable.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  --query-gpu=*) printf "%s\\n" "' + gpu_uuid + ',0,65536,0,65536" ;;\n'
+        '  --query-compute-apps=*) exit 0 ;;\n'
+        '  *) exit 2 ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+
 def _success_json(tmp_path: Path, **overrides: Any) -> str:
     _, request_digest = canonicalize_resource_intent(
         {key: value for key, value in _row().items() if key not in {"card_id", "request_sha256"}}
@@ -100,7 +121,7 @@ def _success_json(tmp_path: Path, **overrides: Any) -> str:
         "gpu_index": 0,
         "snapshot": {"uuid": GPU_UUID, "index": 0},
         "created_at": time.time(),
-        "expires_at": time.time() + 600,
+        "expires_at": time.time() + 1,
         "ledger_digest": _path_digest(tmp_path / "governor.sqlite3"),
         "lock_root_digest": _path_digest(tmp_path),
     }
@@ -151,7 +172,7 @@ def test_success_builds_zero_wait_argv_and_valid_hermes_receipt(
     assert result.receipt["request_digest"] != governor_receipt["request_hash"]
     assert governor_receipt["lease_id"] == result.receipt["lease_id"]
     argv, kwargs = calls[0]
-    assert argv[:3] == [sys.executable, str(ASTRAEUS_GOVERNOR_SCRIPT.resolve()), "--db"]
+    assert argv[:3] == [str(ASTRAEUS_PYTHON), str(ASTRAEUS_GOVERNOR_SCRIPT.resolve()), "--db"]
     assert str((tmp_path / "governor.sqlite3").resolve()) == argv[3]
     assert argv[4:6] == ["reserve", _request_id()]
     assert argv[argv.index("--gpu") + 1] == GPU_UUID
@@ -159,11 +180,12 @@ def test_success_builds_zero_wait_argv_and_valid_hermes_receipt(
     assert argv[argv.index("--headroom-mib") + 1] == "1024"
     assert argv[argv.index("--priority") + 1] == "7"
     assert argv[argv.index("--owner") + 1] == "colony-coder"
-    assert float(argv[argv.index("--deadline") + 1]) == 1_900_000_000.0
+    assert float(argv[argv.index("--deadline") + 1]) == 1_900_000_002.0
     assert argv[argv.index("--ledger-digest") + 1] == _path_digest(tmp_path / "governor.sqlite3")
     assert argv[argv.index("--lock-root-digest") + 1] == _path_digest(tmp_path)
     assert argv[argv.index("--lock-root") + 1] == str(tmp_path.resolve())
-    assert kwargs["timeout"] == SUBPROCESS_TIMEOUT_SECONDS <= 10
+    assert 0 < kwargs["timeout"] <= 2.0
+    assert kwargs["timeout"] <= SUBPROCESS_TIMEOUT_SECONDS <= 10
     assert kwargs["capture_output"] and kwargs["text"] and not kwargs["check"]
 
 
@@ -223,6 +245,8 @@ def test_unresolved_config_defers_without_subprocess(
         "ASTRAEUS_GPU_GOVERNOR_BIN",
         "ASTRAEUS_GPU_GOVERNOR_LEDGER",
         "ASTRAEUS_GPU_GOVERNOR_LOCK_ROOT",
+        "ASTRAEUS_GPU_GOVERNOR_PYTHON",
+        "ASTRAEUS_GPU_GOVERNOR_ADMISSION_WINDOW",
     ):
         monkeypatch.delenv(env_name, raising=False)
     calls = []
@@ -236,27 +260,62 @@ def test_unresolved_config_defers_without_subprocess(
     assert calls == []
 
 
+def test_python_script_requires_explicit_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ASTRAEUS_GPU_GOVERNOR_PYTHON", raising=False)
+    config = _config(tmp_path)
+    config["kanban"]["gpu_governor"].pop("python")
+    result = _invoke(tmp_path, lambda *args, **kwargs: pytest.fail("unexpected subprocess"), config=config)
+    assert result.status == "deferred_resources"
+    assert result.reason == "governor_python_unresolved"
+
+
 def test_config_precedes_environment_and_environment_fills_missing_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env_dir = tmp_path / "from-env"
     env_dir.mkdir()
     monkeypatch.setenv("ASTRAEUS_GPU_GOVERNOR_BIN", str(tmp_path / "env-governor.py"))
+    monkeypatch.setenv("ASTRAEUS_GPU_GOVERNOR_PYTHON", str(tmp_path / "env-python"))
+    monkeypatch.setenv("ASTRAEUS_GPU_GOVERNOR_ADMISSION_WINDOW", "4.5")
     monkeypatch.setenv("ASTRAEUS_GPU_GOVERNOR_LEDGER", str(env_dir / "env.db"))
     monkeypatch.setenv("ASTRAEUS_GPU_GOVERNOR_LOCK_ROOT", str(env_dir))
     config = _config(tmp_path, bin=str(tmp_path / "config-governor.py"))
     config["kanban"]["gpu_governor"].pop("ledger")
     config["kanban"]["gpu_governor"].pop("lock_root")
-    seen: list[list[str]] = []
+    config["kanban"]["gpu_governor"]["python"] = str(tmp_path / "config-python")
+    seen: list[tuple[list[str], dict[str, Any]]] = []
 
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
-        seen.append(argv)
+        seen.append((argv, kwargs))
         return SimpleNamespace(returncode=75, stdout="{}", stderr="")
 
+    started = time.time()
     result = _invoke(tmp_path, runner, config=config)
     assert result.reason == "governor_busy"
-    assert seen[0][0:2] == [sys.executable, str((tmp_path / "config-governor.py").resolve())]
-    assert seen[0][3] == str((env_dir / "env.db").resolve())
+    argv, kwargs = seen[0]
+    assert argv[0:2] == [str((tmp_path / "config-python").resolve()), str((tmp_path / "config-governor.py").resolve())]
+    assert argv[3] == str((env_dir / "env.db").resolve())
+    assert 2.0 <= float(argv[argv.index("--deadline") + 1]) - started < 2.1
+    assert kwargs["timeout"] <= 2.0
+
+    config["kanban"]["gpu_governor"].pop("admission_window_seconds")
+    started = time.time()
+    _invoke(tmp_path, runner, config=config)
+    argv, kwargs = seen[1]
+    assert 4.5 <= float(argv[argv.index("--deadline") + 1]) - started < 4.6
+    assert kwargs["timeout"] <= 4.5
+
+
+def test_invalid_admission_window_defers_before_subprocess(tmp_path: Path) -> None:
+    result = _invoke(
+        tmp_path,
+        lambda *args, **kwargs: pytest.fail("unexpected subprocess"),
+        config=_config(tmp_path, admission_window_seconds=float("nan")),
+    )
+    assert result.status == "deferred_resources"
+    assert result.reason == "invalid_admission_window"
 
 
 def test_persisted_intent_digest_mismatch_defers_without_subprocess(tmp_path: Path) -> None:
@@ -282,94 +341,102 @@ def test_auto_selector_and_bad_card_fields_defer(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(
-    not (ASTRAEUS_PYTHON.is_file() and ASTRAEUS_GOVERNOR_SCRIPT.is_file()),
+    not (ASTRAEUS_PYTHON.is_file() and ASTRAEUS_ROOT.joinpath("src/astraeus/colony/gpu_governor.py").is_file()),
     reason="NOT_RUN: Astraeus checkout or its Python environment is unavailable",
 )
-def test_real_governor_zero_wait_smoke_returns_75_promptly(tmp_path: Path) -> None:
-    ledger = (tmp_path / "smoke.sqlite3").resolve()
-    lock_root = tmp_path.resolve()
-    args = [
-        str(ASTRAEUS_PYTHON), str(ASTRAEUS_GOVERNOR_SCRIPT), "--db", str(ledger),
-        "reserve", "hermes-zero-wait-smoke", "--gpu",
-        "GPU-00000000-0000-0000-0000-000000000000", "--min-free-mib", "0",
-        "--deadline", repr(time.time() - 0.1),
-        "--ledger-digest", _path_digest(ledger),
-        "--lock-root-digest", _path_digest(lock_root),
-        "--lock-root", str(lock_root),
-    ]
-    started = time.monotonic()
-    completed = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
-    wall_seconds = time.monotonic() - started
-    assert completed.returncode == 75, completed.stdout
-    assert wall_seconds < 10
-    envelope = json.loads(completed.stdout)
-    assert envelope["exit_code"] == 75
-    assert envelope["protocol_version"] == "1"
+def test_real_governor_grant_is_accepted_by_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run the configured real CLI with deterministic telemetry and a temp ledger."""
+    gpu_uuid = "GPU-ABCDEF01-2345-6789-ABCD-EF0123456789"
+    _install_nvidia_smi_stub(tmp_path, monkeypatch, gpu_uuid)
+    row = _row(selector_value=gpu_uuid, min_free_mib=0, headroom_mib=0)
+    config = _config(tmp_path, admission_window_seconds=8.0)
+    started_monotonic = time.monotonic()
+    started = time.time()
+    result = reserve_gpu_resource(
+        row,
+        attempt=3,
+        owner="colony-coder",
+        priority=7,
+        config=config,
+    )
+    assert result.status == "granted", result.reason
+    assert time.monotonic() - started_monotonic < 8.0
+    assert result.receipt is not None
+    assert result.receipt["canonical_receipt"]
+    governor_receipt = json.loads(result.receipt["canonical_receipt"])
+    _, admitted_intent_digest = canonicalize_resource_intent({
+        key: value for key, value in row.items() if key not in {"card_id", "request_sha256"}
+    })
+    assert result.receipt["request_digest"] == admitted_intent_digest
+    assert governor_receipt["request_hash"] == _governor_hash(
+        gpu_uuid=gpu_uuid,
+        min_free_mib=0,
+        headroom_mib=0,
+    )
+    assert float(governor_receipt["expires_at"]) <= started + 8.1
+    assert validate_resource_receipt(
+        result.receipt,
+        now=datetime.now(timezone.utc),
+        admitted_request={key: value for key, value in row.items() if key not in {"card_id", "request_sha256"}},
+    ).valid
 
 
 @pytest.mark.skipif(
     not (ASTRAEUS_PYTHON.is_file() and ASTRAEUS_ROOT.joinpath("src/astraeus/colony/gpu_governor.py").is_file()),
     reason="NOT_RUN: Astraeus checkout or its Python environment is unavailable",
 )
-def test_real_governor_receipt_is_accepted_by_adapter(tmp_path: Path) -> None:
-    """Exercise real GovernorLedger/GPUGovernor with a deterministic probe.
-
-    The public adapter sends an already-expired deadline to enforce zero-wait,
-    so the real reserve API necessarily rejects it. For this cross-check only,
-    the runner invokes the same real API with a short future deadline and a
-    temporary ledger; this verifies the v1 request/path digests and receipt
-    serialization against Astraeus without touching its checkout.
-    """
+def test_injected_runner_cross_checks_real_governor_api(tmp_path: Path) -> None:
+    """Keep the direct GPUGovernor digest/receipt cross-check alongside CLI smoke."""
     config = _config(tmp_path)
-    runner_errors: list[str] = []
-
-    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
-        db = Path(argv[argv.index("--db") + 1])
-        request_id = argv[argv.index("reserve") + 1]
-        def arg(name: str) -> str:
-            return argv[argv.index(name) + 1]
-
-        script = r'''import json, sys, time
+    script = """\
+import json, sys, time
 from pathlib import Path
-from astraeus.colony.gpu_governor import GPUGovernor, GPUSnapshot, GovernorLedger, ReservationReceipt, serialize_model, _ledger_digest, _lock_root_digest
+from astraeus.colony.gpu_governor import GPUGovernor, GPUSnapshot, GovernorLedger, ReservationReceipt, serialize_model
+
 ledger_path = Path(sys.argv[1])
-gpu_uuid = sys.argv[2]
-request_id = sys.argv[3]
+gpu_uuid, request_id = sys.argv[2], sys.argv[3]
 min_free_mib, headroom_mib, priority = map(int, sys.argv[4:7])
-owner = sys.argv[7]
-lock_root = Path(sys.argv[8])
-clock = time.time
-ledger = GovernorLedger(ledger_path, clock=clock)
+owner, deadline = sys.argv[7], float(sys.argv[8])
+lock_root = Path(sys.argv[9])
+ledger_digest, lock_root_digest = sys.argv[10:12]
+ledger = GovernorLedger(ledger_path)
 def probe():
     return (GPUSnapshot(gpu_uuid, 0, 65536, 0, 65536, (), time.time()),)
-governor = GPUGovernor(ledger, probe, lock_directory=lock_root, clock=clock)
+governor = GPUGovernor(ledger, probe, lock_directory=lock_root)
 receipt = governor.reserve(
     request_id=request_id, gpu_uuid=gpu_uuid, min_free_mib=min_free_mib,
     headroom_mib=headroom_mib, priority=priority, owner=owner,
-    created_at=time.time(), deadline=time.time() + 120,
-    ledger_path=ledger_path, lock_root=lock_root,
-    ledger_digest=_ledger_digest(ledger_path),
-    lock_root_digest=_lock_root_digest(lock_root),
+    created_at=time.time(), deadline=deadline, ledger_path=ledger_path,
+    lock_root=lock_root, ledger_digest=ledger_digest,
+    lock_root_digest=lock_root_digest,
 )
 if not isinstance(receipt, ReservationReceipt):
-    print(json.dumps({"error": "real governor did not grant", "result": receipt}))
-    raise SystemExit(75 if receipt == 75 else 2)
+    print(json.dumps({"protocol_version": "1", "exit_code": receipt, "deferred": True}))
+    raise SystemExit(receipt if type(receipt) is int else 2)
 print(json.dumps({"protocol_version": receipt.protocol_version, **serialize_model(receipt)}, sort_keys=True))
-'''
+"""
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        def arg(name: str) -> str:
+            return argv[argv.index(name) + 1]
+
+        db = Path(arg("--db"))
         completed = subprocess.run(
             [
                 str(ASTRAEUS_PYTHON), "-c", script,
-                str(db), arg("--gpu"), request_id,
+                str(db), arg("--gpu"), argv[argv.index("reserve") + 1],
                 arg("--min-free-mib"), arg("--headroom-mib"), arg("--priority"),
-                arg("--owner"), str(db.parent),
+                arg("--owner"), arg("--deadline"), arg("--lock-root"),
+                arg("--ledger-digest"), arg("--lock-root-digest"),
             ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=kwargs["timeout"],
             check=False,
             cwd=ASTRAEUS_ROOT,
         )
-        runner_errors.append(completed.stderr)
         return SimpleNamespace(
             returncode=completed.returncode,
             stdout=completed.stdout,
@@ -377,15 +444,28 @@ print(json.dumps({"protocol_version": receipt.protocol_version, **serialize_mode
         )
 
     result = _invoke(tmp_path, runner, config=config)
-    assert result.status == "granted", runner_errors
+    assert result.status == "granted", result.reason
     assert result.receipt is not None
-    assert result.receipt["canonical_receipt"]
-    _, admitted_intent_digest = canonicalize_resource_intent(
-        {key: value for key, value in _row().items() if key not in {"card_id", "request_sha256"}}
+    assert result.receipt["request_digest"] == _row()["request_sha256"]
+
+
+@pytest.mark.skipif(
+    not (ASTRAEUS_PYTHON.is_file() and ASTRAEUS_GOVERNOR_SCRIPT.is_file()),
+    reason="NOT_RUN: Astraeus checkout or its Python environment is unavailable",
+)
+def test_real_governor_ungrantable_request_defers_promptly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_nvidia_smi_stub(tmp_path, monkeypatch, GPU_UUID)
+    row = _row(selector_value="GPU-00000000-0000-0000-0000-000000000000", min_free_mib=0)
+    started = time.monotonic()
+    result = reserve_gpu_resource(
+        row,
+        attempt=3,
+        owner="colony-coder",
+        priority=7,
+        config=_config(tmp_path),
     )
-    assert result.receipt["request_digest"] == admitted_intent_digest
-    assert validate_resource_receipt(
-        result.receipt,
-        now=datetime.now(timezone.utc),
-        admitted_request={key: value for key, value in _row().items() if key not in {"card_id", "request_sha256"}},
-    ).valid
+    assert result.status == "deferred_resources"
+    assert result.reason == "governor_busy"
+    assert time.monotonic() - started < 2.0

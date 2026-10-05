@@ -8,21 +8,27 @@ mirror Astraeus ``_ledger_digest`` / ``_lock_root_digest``: SHA-256 of
 ``str(Path(path).resolve())``. Tests cross-check those formulas against the
 real governor, whose reserve rejects incorrect digests.
 
-The configured ``bin`` is either the governor Python script or an executable;
-Python scripts run with the current interpreter. The CLI's zero-wait contract
-is an absolute deadline equal to the current epoch time. Calls are bounded by
-an independent eight-second subprocess timeout. This adapter never mutates
-Kanban card state; any governor-ledger mutation belongs to the governor CLI.
-It returns a verified receipt or a deferral decision.
+"Zero-wait" means one bounded, non-queuing reservation attempt, not an expired
+deadline: the default admission window is two seconds, configurable with
+``kanban.gpu_governor.admission_window_seconds`` or
+``ASTRAEUS_GPU_GOVERNOR_ADMISSION_WINDOW``. The adapter's subprocess timeout is
+capped by both the remaining window and eight seconds (and remains below the
+adapter's ten-second maximum). The caller's dispatch loop
+still owns the at-most-one-attempt-per-tick invariant. Configure ``bin`` as the
+governor Python script or a native executable. A ``.py`` script requires the
+explicit ``kanban.gpu_governor.python`` / ``ASTRAEUS_GPU_GOVERNOR_PYTHON``
+interpreter so it cannot silently import Astraeus from Hermes' environment.
+This adapter never mutates Kanban card state; any governor-ledger mutation
+belongs to the governor CLI. It returns a verified receipt or a deferral.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,11 +40,14 @@ from hermes_cli.resource_intent import canonicalize_resource_intent
 
 ADAPTER_PROTOCOL_VERSION = 1
 SUBPROCESS_TIMEOUT_SECONDS = 8
+DEFAULT_ADMISSION_WINDOW_SECONDS = 2.0
+MAX_ADMISSION_WINDOW_SECONDS = 10.0
 
 _CONFIG_PATHS = {
     "bin": ("ASTRAEUS_GPU_GOVERNOR_BIN", "bin"),
     "ledger": ("ASTRAEUS_GPU_GOVERNOR_LEDGER", "ledger"),
     "lock_root": ("ASTRAEUS_GPU_GOVERNOR_LOCK_ROOT", "lock_root"),
+    "python": ("ASTRAEUS_GPU_GOVERNOR_PYTHON", "python"),
 }
 
 
@@ -79,7 +88,11 @@ def _resolve_path(config: Mapping[str, Any], name: str) -> Path | None:
         value = os.environ.get(env_name)
     if not isinstance(value, (str, Path)) or not str(value).strip():
         return None
-    return Path(value).expanduser().resolve()
+    path = Path(value).expanduser()
+    if name == "python":
+        # Venv launchers are often symlinks; resolving one bypasses pyvenv.cfg.
+        return Path(os.path.abspath(path))
+    return path.resolve()
 
 
 def _load_config() -> Mapping[str, Any]:
@@ -94,6 +107,27 @@ def _load_config() -> Mapping[str, Any]:
 def _canonical_path_digest(path: Path) -> str:
     """Match the governor's canonical absolute-path digest functions."""
     return hashlib.sha256(str(path.resolve()).encode()).hexdigest()
+
+
+def _admission_window(config: Mapping[str, Any]) -> float | None:
+    present, configured = _config_value(config, "admission_window_seconds")
+    if present and configured not in (None, ""):
+        value = configured
+    else:
+        value = os.environ.get("ASTRAEUS_GPU_GOVERNOR_ADMISSION_WINDOW")
+        if value in (None, ""):
+            return DEFAULT_ADMISSION_WINDOW_SECONDS
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return None
+    window = float(value)
+    if window <= 0 or window > MAX_ADMISSION_WINDOW_SECONDS:
+        return None
+    return window
 
 
 def _strict_json_loads(value: str) -> Any:
@@ -172,11 +206,16 @@ def _governor_request_hash(
 
 
 def _build_argv(
-    *, bin_path: Path, ledger: Path, lock_root: Path,
+    *, bin_path: Path, python_path: Path | None, ledger: Path, lock_root: Path,
     request_id: str, gpu_uuid: str, min_free_mib: int,
     headroom_mib: int, priority: int, owner: str, deadline: float,
 ) -> list[str]:
-    argv = [str(bin_path)] if bin_path.suffix.lower() != ".py" else [sys.executable, str(bin_path)]
+    if bin_path.suffix.lower() == ".py":
+        if python_path is None:
+            return []
+        argv = [str(python_path), str(bin_path)]
+    else:
+        argv = [str(bin_path)]
     argv.extend(
         [
             "--db", str(ledger), "reserve", request_id,
@@ -204,6 +243,7 @@ def _verified_receipt(
     lock_root_digest: str,
     intent: Mapping[str, Any],
     intent_digest: str,
+    deadline: float,
 ) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -224,8 +264,12 @@ def _verified_receipt(
     if not isinstance(token, str) or not token.strip():
         return None
     if type(expiry) is int:
+        if expiry > deadline:
+            return None
         hermes_expiry: int | str = expiry
     elif type(expiry) is float:
+        if not math.isfinite(expiry) or expiry > deadline:
+            return None
         try:
             hermes_expiry = datetime.fromtimestamp(expiry, timezone.utc).isoformat()
         except (OSError, OverflowError, ValueError):
@@ -265,7 +309,7 @@ def reserve_gpu_resource(
     config: Mapping[str, Any] | None = None,
     runner: Callable[..., Any] | None = None,
 ) -> GPUAdapterResult:
-    """Request a zero-wait GPU reservation for a persisted Kanban resource row.
+    """Request one bounded, non-queuing reservation attempt for a persisted row.
 
     ``priority`` is supplied from the persisted card record because
     ``task_resource_requests`` has no priority column. The request row itself is
@@ -280,7 +324,7 @@ def reserve_gpu_resource(
                 return _defer("config_unavailable")
         if not isinstance(config, Mapping):
             return _defer("invalid_config")
-        paths = {name: _resolve_path(config, name) for name in _CONFIG_PATHS}
+        paths = {name: _resolve_path(config, name) for name in ("bin", "ledger", "lock_root")}
         if any(path is None for path in paths.values()):
             missing = [name for name, path in paths.items() if path is None]
             return _defer("unresolved_config:" + ",".join(missing))
@@ -288,6 +332,12 @@ def reserve_gpu_resource(
         ledger = paths["ledger"]
         lock_root = paths["lock_root"]
         assert bin_path is not None and ledger is not None and lock_root is not None
+        python_path = _resolve_path(config, "python") if bin_path.suffix.lower() == ".py" else None
+        if bin_path.suffix.lower() == ".py" and python_path is None:
+            return _defer("governor_python_unresolved")
+        admission_window = _admission_window(config)
+        if admission_window is None:
+            return _defer("invalid_admission_window")
         if ledger.parent.resolve() != lock_root:
             return _defer("governor_cli_lock_root_must_match_ledger_parent")
 
@@ -316,9 +366,11 @@ def reserve_gpu_resource(
         )
         ledger_digest = _canonical_path_digest(ledger)
         lock_root_digest = _canonical_path_digest(lock_root)
-        deadline = time.time()
+        started = time.monotonic()
+        deadline = time.time() + admission_window
         argv = _build_argv(
             bin_path=bin_path,
+            python_path=python_path,
             ledger=ledger,
             lock_root=lock_root,
             request_id=request_id,
@@ -329,11 +381,15 @@ def reserve_gpu_resource(
             owner=owner,
             deadline=deadline,
         )
+        remaining_window = admission_window - max(0.0, time.monotonic() - started)
+        timeout = min(SUBPROCESS_TIMEOUT_SECONDS, remaining_window)
+        if not argv or timeout <= 0:
+            return _defer("admission_window_elapsed")
         result = (runner or subprocess.run)(
             argv,
             capture_output=True,
             text=True,
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
         returncode = getattr(result, "returncode", None)
@@ -357,6 +413,7 @@ def reserve_gpu_resource(
             lock_root_digest=lock_root_digest,
             intent=intent,
             intent_digest=intent_digest,
+            deadline=deadline,
         )
         if verified is None:
             if isinstance(governor_receipt, dict) and governor_receipt.get("protocol_version") != str(ADAPTER_PROTOCOL_VERSION):
