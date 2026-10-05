@@ -145,6 +145,8 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    deferred_resources: list[dict[str, str]] = field(default_factory=list)
+    """Structured resource-admission deferrals; each item names a task and reason."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1992,7 +1994,7 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
-    def _locked_tick() -> DispatchResult:
+    def _locked_tick(*, gpu_admission_locked: bool = True) -> DispatchResult:
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -2006,13 +2008,14 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            gpu_admission_locked=gpu_admission_locked,
         )
 
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
+        result = _locked_tick(gpu_admission_locked=False)
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
@@ -2055,6 +2058,8 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    gpu_resource_intent: Any = None,
+    gpu_admission: Optional[Callable[[str, str, Any], Optional[str]]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2114,6 +2119,13 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
+    if gpu_admission is not None:
+        defer_reason = gpu_admission(task_id, assignee, gpu_resource_intent)
+        if defer_reason is not None:
+            result.deferred_resources.append(
+                {"task_id": task_id, "status": "deferred_resources", "reason": defer_reason}
+            )
+            return False
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
@@ -2294,6 +2306,140 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _ready_gpu_resource_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Persisted GPU requests in ready priority/FIFO order."""
+    try:
+        return conn.execute(
+            """
+            SELECT r.card_id, r.resource_kind, r.schema_version, r.selector_type,
+                   r.selector_value, r.exclusive, r.min_free_mib, r.headroom_mib,
+                   r.reservation_ttl_seconds, r.request_sha256, r.created_at
+              FROM task_resource_requests AS r
+              JOIN tasks AS t ON t.id = r.card_id
+             WHERE t.status = 'ready' AND t.claim_lock IS NULL
+               AND r.resource_kind = 'gpu'
+             ORDER BY t.priority DESC, t.created_at ASC, t.id ASC
+            """
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        message = str(exc).casefold()
+        if "no such table" in message and "task_resource_requests" in message:
+            # Old boards without the additive resource table have no GPU intents.
+            return []
+        raise
+
+
+def _ready_gpu_candidates(
+    conn: sqlite3.Connection, ready_rows: list[sqlite3.Row],
+) -> dict[str, Any]:
+    """Snapshot GPU intents for this tick in priority/FIFO order."""
+    ready_ids = {row["id"] for row in ready_rows}
+    intents: dict[str, Any] = {}
+    for row in _ready_gpu_resource_rows(conn):
+        task_id = row["card_id"]
+        if task_id not in ready_ids:
+            continue
+        try:
+            intents[task_id] = _kb.ResourceIntent.from_row(row)
+        except Exception:
+            # Keep malformed GPU rows in the filter so they fail closed below.
+            intents[task_id] = None
+    return intents
+
+
+def _oldest_current_gpu_candidate(
+    conn: sqlite3.Connection, expected_intents: Mapping[str, Any],
+) -> Optional[str]:
+    """First still-ready GPU row whose intent matches this tick's snapshot."""
+    for row in _ready_gpu_resource_rows(conn):
+        task_id = row["card_id"]
+        expected = expected_intents.get(task_id)
+        if expected is None:
+            continue
+        try:
+            current = _kb.ResourceIntent.from_row(row)
+        except Exception:
+            continue
+        if current == expected:
+            return task_id
+    return None
+
+
+def _gpu_resource_matches_ready_card(
+    conn: sqlite3.Connection, task_id: str, expected_intent: Any,
+) -> tuple[Optional[Any], bool]:
+    """Re-read the card and request immediately before starting a reservation."""
+    try:
+        task = _kb.get_task(conn, task_id)
+        row = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ? AND status = 'ready'", (task_id,)
+        ).fetchone()
+        current_intent = _kb.get_resource_intent(conn, task_id)
+    except Exception:
+        return None, False
+    if task is None or row is None or row["claim_lock"] is not None:
+        return task, False
+    if (
+        expected_intent is None
+        or current_intent != expected_intent
+        or current_intent is None
+        or current_intent.resource_kind != "gpu"
+    ):
+        return task, False
+    return task, True
+
+
+def _reserve_gpu_resource(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    resource_intent: Any,
+    *,
+    on_attempt: Callable[[], None],
+) -> Optional[str]:
+    """Return a deferral reason, or ``None`` after a verified GPU grant."""
+    task, still_valid = _gpu_resource_matches_ready_card(conn, task_id, resource_intent)
+    if not still_valid:
+        return "resource_request_changed"
+    try:
+        from datetime import datetime, timezone
+
+        from hermes_cli.kanban_gpu_governor_adapter import reserve_gpu_resource
+        from hermes_cli.kanban_resource_receipt import validate_resource_receipt
+
+        on_attempt()
+        decision = reserve_gpu_resource(
+            resource_intent.to_dict(),
+            attempt=max(1, task.consecutive_failures + 1),
+            owner=assignee,
+            priority=task.priority,
+        )
+        if not getattr(decision, "granted", False):
+            reason = getattr(decision, "reason", None)
+            return reason if isinstance(reason, str) and reason else "governor_deferred"
+        receipt = getattr(decision, "receipt", None)
+        if not isinstance(receipt, Mapping):
+            return "malformed_reservation_receipt"
+        admitted_request = {
+            key: getattr(resource_intent, key)
+            for key in (
+                "resource_kind", "schema_version", "selector_type", "selector_value",
+                "exclusive", "min_free_mib", "headroom_mib", "reservation_ttl_seconds",
+            )
+        }
+        validation = validate_resource_receipt(
+            receipt,
+            now=datetime.now(timezone.utc),
+            admitted_request=admitted_request,
+        )
+        if not validation.valid:
+            return "reservation_receipt_validation_failed"
+    except Exception:
+        _kb._log.debug("kanban dispatch: GPU admission failed closed for %s", task_id)
+        return "gpu_admission_error"
+    return None
+
+
 def _any_spawnable_review(
     conn: sqlite3.Connection,
     review_rows: list[sqlite3.Row],
@@ -2358,6 +2504,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gpu_admission_locked: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2376,6 +2523,20 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
+    gpu_intents = _ready_gpu_candidates(conn, ready_rows)
+    gpu_attempted = False
+
+    def _admit_gpu(task_id: str, assignee: str, resource_intent: Any) -> Optional[str]:
+        nonlocal gpu_attempted
+
+        def _mark_attempted() -> None:
+            nonlocal gpu_attempted
+            gpu_attempted = True
+
+        return _reserve_gpu_resource(
+            conn, task_id, assignee, resource_intent, on_attempt=_mark_attempted,
+        )
+
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
@@ -2419,6 +2580,39 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        gpu_resource_intent = gpu_intents.get(row["id"])
+        is_gpu_card = row["id"] in gpu_intents
+        if is_gpu_card and not dry_run:
+            if gpu_resource_intent is None:
+                result.deferred_resources.append(
+                    {"task_id": row["id"], "status": "deferred_resources", "reason": "invalid_resource_intent"}
+                )
+                continue
+            if not gpu_admission_locked:
+                result.deferred_resources.append(
+                    {"task_id": row["id"], "status": "deferred_resources", "reason": "dispatch_lock_unavailable"}
+                )
+                continue
+            if gpu_attempted:
+                result.deferred_resources.append(
+                    {"task_id": row["id"], "status": "deferred_resources", "reason": "reservation_attempt_limit_reached"}
+                )
+                continue
+            _, intent_unchanged = _gpu_resource_matches_ready_card(
+                conn, row["id"], gpu_resource_intent,
+            )
+            if not intent_unchanged:
+                result.deferred_resources.append(
+                    {"task_id": row["id"], "status": "deferred_resources", "reason": "resource_request_changed"}
+                )
+                continue
+            oldest_gpu_id = _oldest_current_gpu_candidate(conn, gpu_intents)
+            if oldest_gpu_id != row["id"]:
+                reason = "older_gpu_card_pending" if oldest_gpu_id else "gpu_request_state_unavailable"
+                result.deferred_resources.append(
+                    {"task_id": row["id"], "status": "deferred_resources", "reason": reason}
+                )
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
@@ -2430,7 +2624,14 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+        task_lane_kwargs = lane_kwargs
+        if is_gpu_card and not dry_run:
+            task_lane_kwargs = {
+                **lane_kwargs,
+                "gpu_resource_intent": gpu_resource_intent,
+                "gpu_admission": _admit_gpu,
+            }
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **task_lane_kwargs):
             spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
